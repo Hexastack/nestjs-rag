@@ -2,8 +2,7 @@ import type { DataSource, EntityTarget, ObjectLiteral } from 'typeorm';
 import { RagSourceFilter, RagSourceMapping, RagSourceProvider, RagSourceRecord, RagSourceTransform } from '../../interfaces/source.interface';
 import { mapRecordToSourceRecord } from '../mapping.util';
 import { assertSafeIdentifier } from '../../utils/identifier.util';
-
-const DEFAULT_BATCH_SIZE = 200;
+import { DEFAULT_SOURCE_BATCH_SIZE } from '../../constants';
 
 /**
  * `RagSourceProvider` backed by a TypeORM entity. Reads go through the
@@ -37,7 +36,7 @@ export class EntitySourceProvider<TEntity extends ObjectLiteral = ObjectLiteral>
     batchSize: number;
   }): Promise<{ records: RagSourceRecord[]; nextCursor: string | null }> {
     const repo = this.dataSource.getRepository(this.entity);
-    const batchSize = options.batchSize || this.filter?.batchSize || DEFAULT_BATCH_SIZE;
+    const batchSize = options.batchSize || this.filter?.batchSize || DEFAULT_SOURCE_BATCH_SIZE;
     const idProp = this.mapping.id as string;
 
     const qb = repo.createQueryBuilder('e').orderBy(`e.${idProp}`, 'ASC').limit(batchSize);

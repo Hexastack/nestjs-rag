@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Repository } from 'typeorm';
 import { RAG_INDEXING_SERVICE, RAG_SOURCE_BINDING_REPOSITORY } from '../constants';
-import { RagChangeImpact } from '../enums';
+import { RagChangeImpact, RagOperationStatus } from '../enums';
 import { RagSourceBindingRow } from '../entities/rows';
 import { RagReindexRequiredError, RagSourceNotFoundError } from '../errors';
 import { RagEventNames, RagSourceProfileChangedEvent } from '../events/rag-events';
@@ -18,12 +18,11 @@ import { RagSourceDescriptor } from '../interfaces/source.interface';
 import { RagConfigurationChangePreview } from '../interfaces/config-api.interface';
 import { RagConfigurationService } from '../config/rag-configuration.service';
 import { newId } from '../utils/id.util';
-import { assertAllowedSourceRetrievalOverrides, RagResolvedSourceWiring, RagSourceRegistry } from './source-registry';
+import { assertAllowedSourceRetrievalOverrides, RagSourceRegistry } from './source-registry';
 // Type-only import: see the note in RagConfigurationService for why this
 // never creates a runtime import cycle with the indexing module.
 import type { RagIndexingService } from '../indexing/rag-indexing.service';
 import { RagProfileReindexResult } from '../interfaces/reindex.interface';
-import { RagOperationStatus } from '../enums';
 
 interface StoredSourceConfiguration {
   chunkingOverrides?: Partial<RagChunkingOptions>;
@@ -100,11 +99,6 @@ export class RagSourceConfigurationService {
       mappingVersion: wiring.mappingVersion,
       synchronization: wiring.synchronization,
     };
-  }
-
-  /** Wiring is code-supplied and never persisted; exposed for the indexing service. */
-  getWiring(sourceName: string): RagResolvedSourceWiring {
-    return this.registry.get(sourceName);
   }
 
   async previewSourceUpdate(

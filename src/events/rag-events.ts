@@ -15,8 +15,6 @@ export const RagEventNames = {
   PROFILE_REVISION_FAILED: 'rag.profile.revision.failed',
   PROFILE_ROLLED_BACK: 'rag.profile.rolled_back',
   SOURCE_PROFILE_CHANGED: 'rag.source.profile.changed',
-  PROVIDER_REGISTERED: 'rag.provider.registered',
-  PROVIDER_UNREGISTERED: 'rag.provider.unregistered',
 } as const;
 
 export interface RagProfileCreatedEvent {
@@ -38,8 +36,4 @@ export interface RagSourceProfileChangedEvent {
   sourceName: string;
   previousProfileName: string;
   newProfileName: string;
-}
-
-export interface RagProviderEvent {
-  providerId: string;
 }

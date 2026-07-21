@@ -47,8 +47,8 @@ export class RagSearchService {
   private readonly vectorAdapter?: RagVectorSearchAdapter;
 
   constructor(
-    @Inject(RAG_DATA_SOURCE) private readonly dataSource: DataSource,
-    @Inject(RAG_SCHEMA_SERVICE) private readonly schemaService: RagSchemaService,
+    @Inject(RAG_DATA_SOURCE) dataSource: DataSource,
+    @Inject(RAG_SCHEMA_SERVICE) schemaService: RagSchemaService,
     @Inject(RAG_RESOLVED_OPTIONS) private readonly context: RagResolvedModuleContext,
     @Inject(RAG_CHUNK_REPOSITORY) private readonly chunkRepo: Repository<RagChunkRow>,
     @Inject(RAG_DOCUMENT_REPOSITORY) private readonly documentRepo: Repository<RagDocumentRow>,

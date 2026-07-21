@@ -52,7 +52,6 @@ export interface RagResolvedSourceWiring<TEntity extends ObjectLiteral = ObjectL
   entity?: EntityTarget<TEntity>;
   table?: string;
   provider?: RagSourceProvider;
-  dataSourceName?: string;
   mapping?: RagSourceMapping<TEntity>;
   namespace?: string;
   filter?: RagSourceOptions<TEntity>['filter'];
@@ -131,7 +130,6 @@ export function buildSourceWiring<TEntity extends ObjectLiteral>(
     entity: options.entity,
     table: options.table,
     provider: kind === 'provider' ? resolveProviderInstance(options.provider) : undefined,
-    dataSourceName: options.dataSourceName,
     mapping: options.mapping,
     namespace: options.namespace,
     filter: options.filter,

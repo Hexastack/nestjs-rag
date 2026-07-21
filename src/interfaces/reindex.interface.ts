@@ -25,11 +25,10 @@ export interface RagSourceSyncResult {
 }
 
 export interface RagProfileReindexOptions {
+  /** Restrict the re-index to these source names (defaults to every source bound to the profile). */
   sources?: string[];
-  concurrency?: number;
   batchSize?: number;
   continueOnError?: boolean;
-  validateBeforeActivation?: boolean;
 }
 
 export interface RagProfileReindexResult {

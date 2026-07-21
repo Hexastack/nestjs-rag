@@ -1,5 +1,6 @@
 import { DynamicModule, Module, Provider } from '@nestjs/common';
 import { TypeOrmModule, getDataSourceToken, getRepositoryToken } from '@nestjs/typeorm';
+import type { DataSource } from 'typeorm';
 import {
   DEFAULT_PROFILE_NAME,
   DEFAULT_TABLE_PREFIX,
@@ -160,7 +161,7 @@ export class RagModule {
 
     const schemaServiceProvider: Provider = {
       provide: RAG_SCHEMA_SERVICE,
-      useFactory: (dataSource: any, context: RagResolvedModuleContext) =>
+      useFactory: (dataSource: DataSource, context: RagResolvedModuleContext) =>
         new RagSchemaService(dataSource, schemas, tablePrefix, database.type, {
           autoInitialize: context.autoInitialize,
           createVectorExtension: context.createVectorExtension,

@@ -1,5 +1,4 @@
 import type { EmbeddingModel } from 'ai';
-import { RagEmbeddingConfiguration } from './profile.interface';
 
 export interface RagEmbeddingModelOptions {
   modelId: string;
@@ -39,12 +38,3 @@ export interface RagEmbeddingProviderFactory {
 
 /** Marker type used by DI tokens for classes implementing the factory contract. */
 export type RagEmbeddingProviderFactoryClass = new (...args: any[]) => RagEmbeddingProviderFactory;
-
-export interface RagEmbeddingProviderRegistryContract {
-  register(provider: RagEmbeddingProviderFactory): void;
-  unregister(providerId: string): void;
-  has(providerId: string): boolean;
-  get(providerId: string): RagEmbeddingProviderFactory;
-  list(): RagEmbeddingProviderFactory[];
-  createModel(configuration: RagEmbeddingConfiguration): EmbeddingModel;
-}

@@ -27,13 +27,14 @@ export interface RagSourceMapping<TEntity extends ObjectLiteral = ObjectLiteral>
   namespace?: string | RagNamespaceMapping;
   updatedAt?: string;
   deletedAt?: string;
-  /** Optional discriminator, used when a single record produces multiple documents. */
+  /** Never set at runtime — phantom field that keeps `TEntity` referenced so inference flows through generic helpers. */
   _entityHint?: TEntity;
 }
 
 export interface RagSourceFilter<TEntity extends ObjectLiteral = ObjectLiteral> {
   where?: Record<string, unknown>;
   batchSize?: number;
+  /** Never set at runtime — phantom field that keeps `TEntity` referenced so inference flows through generic helpers. */
   _entityHint?: TEntity;
 }
 
@@ -79,8 +80,6 @@ export interface RagSourceOptions<TEntity extends ObjectLiteral = ObjectLiteral>
   entity?: EntityTarget<TEntity>;
   table?: string;
   provider?: Type<RagSourceProvider> | RagSourceProvider;
-
-  dataSourceName?: string;
 
   profileName?: string;
 

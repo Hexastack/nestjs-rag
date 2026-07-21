@@ -202,15 +202,7 @@ export class RagConfigurationService {
     const revisions = await this.revisionRepo.find({ where: { profileId: profileRow.id } });
     await this.dataSource.transaction(async (manager) => {
       for (const rev of revisions) {
-        await manager.delete(this.chunkEmbeddingRepo.target, { profileRevisionId: rev.id });
-        await manager.delete(this.chunkRepo.target, { profileRevisionId: rev.id });
-        await manager.delete(this.documentRepo.target, { profileRevisionId: rev.id });
-        if (this.schemaService.isSqlite()) {
-          await manager.query(
-            `DELETE FROM "${this.schemaService.ftsTableName()}" WHERE profile_revision_id = ?`,
-            [rev.id],
-          );
-        }
+        await this.deleteRevisionIndexRows(manager, rev.id);
       }
       await manager.delete(this.revisionRepo.target, { profileId: profileRow.id });
       await manager.delete(this.profileRepo.target, { id: profileRow.id });
@@ -239,45 +231,41 @@ export class RagConfigurationService {
   }
 
   async previewUpdate(profileName: string, patch: UpdateRagProfileInput): Promise<RagConfigurationChangePreview> {
-    const { revisionRow } = await this.loadActive(profileName);
-    const current = revisionRow.configuration as RagProfileConfiguration;
-    const proposed = withProfileDefaults(applyProfilePatch(current, patch));
-    const structural = validateProfileConfigurationStructure(proposed, this.validationContext());
-    if (structural.errors.length > 0) {
-      throw new RagValidationError(structural.errors);
-    }
-    const diff = analyzeConfigurationChange(current, proposed);
-    const affectedSources =
-      diff.impact === RagChangeImpact.NONE ? [] : await this.listAffectedSourceNames(profileName);
-    return this.toPreview(profileName, revisionRow.id, proposed, diff, affectedSources);
+    const { preview } = await this.prepareChange(profileName, patch);
+    return preview;
   }
 
   // ---------------------------------------------------------------------
   // Update strategies
   // ---------------------------------------------------------------------
 
+  /**
+   * Applies a deep-partial `patch` to the profile's active configuration
+   * under one of four strategies:
+   *
+   * - `validate-only` — validate and classify the change; persist nothing.
+   * - `apply-immediately` — only for query-only changes: creates and
+   *   activates a new revision by re-pointing the existing index rows
+   *   (throws `RagReindexRequiredError` otherwise).
+   * - `stage` — persists a `pending` revision to be re-indexed later.
+   * - `reindex-and-activate` — stages, re-indexes, and activates in one
+   *   call (falling back to the immediate path when no re-index is needed).
+   *
+   * Pass `options.expectedRevisionId` for optimistic concurrency control:
+   * the update fails with `RagConcurrencyError` if another writer activated
+   * a different revision in the meantime.
+   */
   async updateProfile(
     profileName: string,
     patch: UpdateRagProfileInput,
     options: UpdateRagProfileOptions,
   ): Promise<RagConfigurationUpdateResult> {
-    const { profileRow, revisionRow: activeRow } = await this.loadActive(profileName);
+    const { profileRow, activeRow, proposed, diff, preview } = await this.prepareChange(profileName, patch);
     if (options.expectedRevisionId && options.expectedRevisionId !== profileRow.activeRevisionId) {
       throw new RagConcurrencyError(profileName, options.expectedRevisionId, profileRow.activeRevisionId ?? 'none');
     }
-
-    const current = activeRow.configuration as RagProfileConfiguration;
-    const proposed = withProfileDefaults(applyProfilePatch(current, patch));
-    const structural = validateProfileConfigurationStructure(proposed, this.validationContext());
-    if (structural.errors.length > 0) {
-      throw new RagValidationError(structural.errors);
-    }
     await this.assertEmbeddingProviderValid(proposed);
 
-    const diff = analyzeConfigurationChange(current, proposed);
-    const affectedSources =
-      diff.impact === RagChangeImpact.NONE ? [] : await this.listAffectedSourceNames(profileName);
-    const preview = this.toPreview(profileName, activeRow.id, proposed, diff, affectedSources);
     const strategy = options.applyStrategy;
 
     switch (strategy) {
@@ -318,6 +306,13 @@ export class RagConfigurationService {
     }
   }
 
+  /**
+   * Atomically switches the profile's active revision to `revisionId`
+   * (which must be `ready`, or `archived` for a rollback), archiving the
+   * previously active one. Refuses to activate an index whose chunk and
+   * embedding counts are inconsistent, or one that needs the missing
+   * pgvector extension.
+   */
   async activateRevision(profileName: string, revisionId: string): Promise<RagProfileRevision> {
     const profileRow = await this.findProfileRowOrThrow(profileName);
     const revisionRow = await this.findRevisionRowOrThrow(profileName, revisionId);
@@ -410,15 +405,7 @@ export class RagConfigurationService {
     const deleted: string[] = [];
     for (const rev of toDelete) {
       await this.dataSource.transaction(async (manager) => {
-        await manager.delete(this.chunkEmbeddingRepo.target, { profileRevisionId: rev.id });
-        await manager.delete(this.chunkRepo.target, { profileRevisionId: rev.id });
-        await manager.delete(this.documentRepo.target, { profileRevisionId: rev.id });
-        if (this.schemaService.isSqlite()) {
-          await manager.query(
-            `DELETE FROM "${this.schemaService.ftsTableName()}" WHERE profile_revision_id = ?`,
-            [rev.id],
-          );
-        }
+        await this.deleteRevisionIndexRows(manager, rev.id);
         await manager.delete(this.revisionRepo.target, { id: rev.id });
       });
       await this.dropAuxiliaryIndexesFor(rev);
@@ -430,6 +417,36 @@ export class RagConfigurationService {
   // ---------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------
+
+  /**
+   * Shared front half of `previewUpdate` and `updateProfile`: applies the
+   * patch to the active revision's configuration, validates the result
+   * structurally (throwing `RagValidationError` on failure), and classifies
+   * the change's impact. Performs no writes and no provider-side validation.
+   */
+  private async prepareChange(
+    profileName: string,
+    patch: UpdateRagProfileInput,
+  ): Promise<{
+    profileRow: RagProfileRow;
+    activeRow: RagProfileRevisionRow;
+    proposed: RagProfileConfiguration;
+    diff: RagChangeImpactResult;
+    preview: RagConfigurationChangePreview;
+  }> {
+    const { profileRow, revisionRow: activeRow } = await this.loadActive(profileName);
+    const current = activeRow.configuration as RagProfileConfiguration;
+    const proposed = withProfileDefaults(applyProfilePatch(current, patch));
+    const structural = validateProfileConfigurationStructure(proposed, this.validationContext());
+    if (structural.errors.length > 0) {
+      throw new RagValidationError(structural.errors);
+    }
+    const diff = analyzeConfigurationChange(current, proposed);
+    const affectedSources =
+      diff.impact === RagChangeImpact.NONE ? [] : await this.listAffectedSourceNames(profileName);
+    const preview = this.toPreview(profileName, activeRow.id, proposed, diff, affectedSources);
+    return { profileRow, activeRow, proposed, diff, preview };
+  }
 
   private toPreview(
     profileName: string,
@@ -694,6 +711,25 @@ export class RagConfigurationService {
       await manager.query(
         `UPDATE "${this.schemaService.ftsTableName()}" SET profile_revision_id = ? WHERE profile_revision_id = ?`,
         [toRevisionId, fromRevisionId],
+      );
+    }
+  }
+
+  /**
+   * Permanently deletes every index row (documents, chunks, embeddings, and
+   * the SQLite FTS rows) one revision owns, inside the caller's transaction.
+   * Shared by `deleteProfile` and `cleanupArchivedRevisions`; the caller is
+   * responsible for deleting the revision row itself and for dropping any
+   * Postgres indexes afterwards (`dropAuxiliaryIndexesFor`).
+   */
+  private async deleteRevisionIndexRows(manager: EntityManager, revisionId: string): Promise<void> {
+    await manager.delete(this.chunkEmbeddingRepo.target, { profileRevisionId: revisionId });
+    await manager.delete(this.chunkRepo.target, { profileRevisionId: revisionId });
+    await manager.delete(this.documentRepo.target, { profileRevisionId: revisionId });
+    if (this.schemaService.isSqlite()) {
+      await manager.query(
+        `DELETE FROM "${this.schemaService.ftsTableName()}" WHERE profile_revision_id = ?`,
+        [revisionId],
       );
     }
   }

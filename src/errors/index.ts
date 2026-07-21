@@ -14,8 +14,6 @@ export class RagProviderNotFoundError extends RagConfigurationError {
   }
 }
 
-export class RagModelConfigurationError extends RagConfigurationError {}
-
 export class RagProfileNotFoundError extends RagConfigurationError {
   constructor(profileName: string) {
     super(`RAG profile "${profileName}" was not found.`, { profileName });

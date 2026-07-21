@@ -1,6 +1,7 @@
-import { Inject, Injectable, Logger, forwardRef } from '@nestjs/common';
+import { Inject, Injectable, forwardRef } from '@nestjs/common';
 import { DataSource, Repository } from 'typeorm';
 import {
+  DEFAULT_SOURCE_BATCH_SIZE,
   DIRECT_SOURCE_NAME,
   RAG_CHUNK_EMBEDDING_REPOSITORY,
   RAG_CHUNK_REPOSITORY,
@@ -35,8 +36,6 @@ import { RagResolvedSourceWiring, RagSourceRegistry } from '../source/source-reg
 import { hashContent, hashIndexingInputs } from '../utils/hash.util';
 import { newId } from '../utils/id.util';
 
-const DEFAULT_SYNC_BATCH_SIZE = 200;
-
 interface RevisionContext {
   profileName: string;
   revisionId: string;
@@ -51,7 +50,6 @@ interface RevisionContext {
  */
 @Injectable()
 export class RagIndexingService {
-  private readonly logger = new Logger(RagIndexingService.name);
   private readonly providerCache = new Map<string, RagSourceProvider>();
   private readonly ensuredIndexKeys = new Set<string>();
 
@@ -303,7 +301,7 @@ export class RagIndexingService {
   ): Promise<RagSourceSyncResult> {
     const wiring = this.sourceRegistry.get(sourceName);
     const provider = this.resolveProvider(wiring);
-    const batchSize = options.batchSize ?? wiring.filter?.batchSize ?? DEFAULT_SYNC_BATCH_SIZE;
+    const batchSize = options.batchSize ?? wiring.filter?.batchSize ?? DEFAULT_SOURCE_BATCH_SIZE;
     const overrides = await this.getEffectiveSourceOverrides(sourceName, wiring);
 
     let since: Date | undefined;

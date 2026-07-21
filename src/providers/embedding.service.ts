@@ -1,14 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { embed, embedMany } from 'ai';
 import type { EmbeddingModel } from 'ai';
 import { RagEmbeddingDimensionError } from '../errors';
 import { RagEmbeddingConfiguration } from '../interfaces/profile.interface';
 import { hashConfiguration } from '../utils/hash.util';
 import { RagEmbeddingProviderRegistry } from './embedding-provider-registry';
-
-export interface RagEmbedManyResult {
-  vectors: number[][];
-}
 
 /**
  * Thin, testable wrapper around the Vercel AI SDK's `embed`/`embedMany`.
@@ -21,7 +17,6 @@ export interface RagEmbedManyResult {
  */
 @Injectable()
 export class RagEmbeddingService {
-  private readonly logger = new Logger(RagEmbeddingService.name);
   private readonly modelCache = new Map<string, EmbeddingModel>();
 
   constructor(private readonly registry: RagEmbeddingProviderRegistry) {

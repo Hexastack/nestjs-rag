@@ -2,13 +2,12 @@ import type { DataSource } from 'typeorm';
 import { RagSourceFilter, RagSourceMapping, RagSourceProvider, RagSourceRecord } from '../../interfaces/source.interface';
 import { mapRecordToSourceRecord } from '../mapping.util';
 import { assertSafeIdentifier } from '../../utils/identifier.util';
-
-const DEFAULT_BATCH_SIZE = 200;
+import { DEFAULT_SOURCE_BATCH_SIZE } from '../../constants';
 
 /** `batchSize` is interpolated into `LIMIT` (placeholders aren't reliable there across drivers) — force it to a safe positive integer. */
 function sanitizeBatchSize(value: number | undefined): number {
   const parsed = Math.floor(Number(value));
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_BATCH_SIZE;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SOURCE_BATCH_SIZE;
 }
 
 /**
