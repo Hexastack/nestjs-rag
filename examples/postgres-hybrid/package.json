@@ -1,0 +1,29 @@
+{
+  "name": "example-postgres-hybrid",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Example: multiple profiles, an OpenAI embedding provider, and hybrid (lexical + pgvector) retrieval on PostgreSQL.",
+  "scripts": {
+    "start": "ts-node src/main.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^2.0.0",
+    "@nestjs/common": "^11.0.13",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/core": "^11.0.13",
+    "@nestjs/event-emitter": "^3.0.1",
+    "@nestjs/platform-express": "^11.0.13",
+    "@nestjs/typeorm": "^11.0.0",
+    "@scope/nestjs-rag": "file:../..",
+    "pg": "^8.13.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "typeorm": "^0.3.20"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2",
+    "@types/node": "^20.17.9"
+  }
+}
