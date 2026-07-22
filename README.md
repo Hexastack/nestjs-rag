@@ -264,7 +264,7 @@ sources: [
       id: 'id',
       content: [{ column: 'title', label: 'Title' }, { column: 'content', label: 'Content' }],
       metadata: ['category', 'language'],
-      namespace: { column: 'language', prefix: 'kb-' },
+      namespace: { column: 'language', prefix: 'kb-' }, // convenient, but see "Namespace vs. sources vs. metadata vs. profiles" below
       updatedAt: 'updatedAt',
     },
     filter: { where: { status: 'published' }, batchSize: 250 },
@@ -344,6 +344,23 @@ const results = await ragService.search('installation appointment', {
 ```
 
 `search()` always resolves the requested (or default) profile's **active** revision unless an explicit, profile-validated `revisionId` is supplied for administrative testing — results only ever come from chunks/embeddings tagged with that one revision id.
+
+### Namespace vs. sources vs. metadata vs. profiles
+
+Four different mechanisms narrow what a search sees, and they answer different questions:
+
+| Mechanism | Question it answers | Applied | Changing it |
+|---|---|---|---|
+| `sources: [...]` | Which *origin* is this content from? | Pushed into the SQL, before ranking | Free — just a filter |
+| `namespace(s): [...]` | Which *partition* of one source's content is this? (tenant, user, product line, doc version, ...) | Pushed into the SQL, before ranking | Free — just a filter |
+| `metadata: {...}` | Does this chunk's stored metadata match these key/value pairs? | Applied in application code, *after* candidate retrieval | Free — just a filter |
+| A separate **profile** | Should this content be chunked/embedded/analyzed *differently*? | A structural choice, not a query-time filter | Requires re-indexing under the new profile |
+
+`namespace` is an opaque, per-document label (set directly on `ingest()`, or derived per record via a source's `mapping.namespace`) with no meaning to the package beyond "documents sharing this string can be filtered together." It fits any partition that's orthogonal to source — multi-tenancy (`namespace: tenant-{id}`), per-user or per-conversation collections, visibility tiers (`public`/`internal`), product lines, or documentation versions. `namespaces: [...]` (plural) searches several partitions at once, e.g. a tenant's own namespace plus a shared one.
+
+**It is not a substitute for per-language configuration.** The `sources` example above uses `namespace: { column: 'language', prefix: 'kb-' }` for convenience, but namespace only *filters rows* — it never changes how text is analyzed. `retrieval.lexical.language` is the setting that actually controls tokenization/stemming (via Postgres's `to_tsvector('<language>', ...)`, with a matching per-revision GIN index; SQLite's FTS5 ignores it), and it applies to **every document in the profile**, not per namespace. If you namespace English and French documents together under one profile, both are still analyzed with that profile's single `lexical.language` — the non-matching language gets no stemming benefit. For real per-language lexical quality, use **one profile per language** (each with its own `retrieval.lexical.language`), and reserve namespace for an axis that's genuinely orthogonal to language, like tenant or visibility.
+
+Note namespace is a scoping convenience, not a security boundary: nothing authenticates namespace access — your application layer must supply the caller's allowed namespace(s) to `search()`, never trust a namespace value from the end user.
 
 **`minScore` semantics.** Scores live on a different scale per mode: lexical scores are negated BM25 (SQLite) or `ts_rank_cd` (Postgres), embedding scores are cosine similarity, and hybrid result scores are RRF values (bounded by `weight / (rrfK + 1)`, ≈ 0.016 with defaults). `minScore` is therefore applied to the **raw per-signal scores** — in hybrid mode it filters the lexical and embedding candidate lists *before* fusion, never the fused RRF score.
 
