@@ -35,6 +35,7 @@ export class InitRagSchema1700000000001 implements MigrationInterface {
         "configuration_hash" varchar(128) NOT NULL,
         "change_impact" varchar(32) NOT NULL,
         "previous_revision_id" varchar(36),
+        "data_revision_id" varchar(36) NOT NULL,
         "error" text,
         "created_at" datetime NOT NULL DEFAULT (datetime('now')),
         "activated_at" datetime,

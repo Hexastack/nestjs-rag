@@ -168,6 +168,7 @@ export class RagConfigurationService {
         configurationHash: hashConfiguration(configuration),
         changeImpact: RagChangeImpact.NONE,
         previousRevisionId: null,
+        dataRevisionId: revisionId,
         error: null,
         createdAt: now,
         activatedAt: now,
@@ -245,8 +246,8 @@ export class RagConfigurationService {
    *
    * - `validate-only` — validate and classify the change; persist nothing.
    * - `apply-immediately` — only for query-only changes: creates and
-   *   activates a new revision by re-pointing the existing index rows
-   *   (throws `RagReindexRequiredError` otherwise).
+   *   activates a new revision that shares the existing index rows via its
+   *   `dataRevisionId` (throws `RagReindexRequiredError` otherwise).
    * - `stage` — persists a `pending` revision to be re-indexed later.
    * - `reindex-and-activate` — stages, re-indexes, and activates in one
    *   call (falling back to the immediate path when no re-index is needed).
@@ -327,21 +328,15 @@ export class RagConfigurationService {
       );
     }
 
-    // A revision archived by an `apply-immediately` update owns no index rows
-    // of its own — they were bulk re-pointed to its successor. Rolling back to
-    // it is still safe as long as every revision between it and the currently
-    // active one is query-only: the active revision's rows are, by
-    // construction, exactly the rows this revision indexed, so they can be
-    // re-pointed back as part of activation.
-    const repointFromRevisionId = await this.resolveRepointSource(profileRow, revisionRow);
-
-    await this.validateIndexConsistency(revisionRow, repointFromRevisionId ?? revisionRow.id);
+    // Index rows always stay with the revision that built them
+    // (`dataRevisionId`); a query-only revision references its indexing
+    // ancestor's row set instead of owning rows. Activation — including
+    // rollback in either direction across a query-only lineage — is
+    // therefore a pure pointer flip and never moves rows.
+    await this.validateIndexConsistency(revisionRow);
 
     const now = new Date();
     await this.dataSource.transaction(async (manager) => {
-      if (repointFromRevisionId) {
-        await this.repointIndexRows(manager, repointFromRevisionId, revisionId);
-      }
       if (profileRow.activeRevisionId && profileRow.activeRevisionId !== revisionId) {
         await manager.update(
           this.revisionRepo.target,
@@ -356,13 +351,6 @@ export class RagConfigurationService {
       );
       await manager.update(this.profileRepo.target, { id: profileRow.id }, { activeRevisionId: revisionId, updatedAt: now });
     });
-    if (repointFromRevisionId) {
-      await this.repointPostgresIndexes(
-        repointFromRevisionId,
-        revisionId,
-        revisionRow.configuration as RagProfileConfiguration,
-      );
-    }
 
     const updated = await this.getRevision(profileName, revisionId);
     this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_ACTIVATED, { profileName, revision: updated } satisfies RagProfileRevisionEvent);
@@ -404,6 +392,20 @@ export class RagConfigurationService {
     const toDelete = archived.slice(keep);
     const deleted: string[] = [];
     for (const rev of toDelete) {
+      // A query-only lineage shares its indexing ancestor's physical rows
+      // (`dataRevisionId`), so this revision's rows may still be served by
+      // the active revision or by a retained archived one. Skip it while any
+      // other revision references it; checked per revision inside the loop
+      // (newest-first), so purging a referencing successor in this same run
+      // unblocks its ancestor.
+      const referencedBy = await this.revisionRepo
+        .createQueryBuilder('r')
+        .where('r.dataRevisionId = :id', { id: rev.id })
+        .andWhere('r.id != :id', { id: rev.id })
+        .getCount();
+      if (referencedBy > 0) {
+        continue;
+      }
       await this.dataSource.transaction(async (manager) => {
         await this.deleteRevisionIndexRows(manager, rev.id);
         await manager.delete(this.revisionRepo.target, { id: rev.id });
@@ -473,8 +475,9 @@ export class RagConfigurationService {
     proposed: RagProfileConfiguration,
     diff: RagChangeImpactResult,
   ): RagProfileRevision {
+    const id = `ephemeral-${newId()}`;
     return {
-      id: `ephemeral-${newId()}`,
+      id,
       profileName,
       revisionNumber: activeRow.revisionNumber + 1,
       status: RagRevisionStatus.DRAFT,
@@ -483,6 +486,7 @@ export class RagConfigurationService {
       changeImpact: diff.impact,
       createdAt: new Date(),
       previousRevisionId: activeRow.id,
+      dataRevisionId: diff.canApplyImmediately ? activeRow.dataRevisionId : id,
     };
   }
 
@@ -505,6 +509,9 @@ export class RagConfigurationService {
       configurationHash: hashConfiguration(proposed),
       changeImpact: diff.impact,
       previousRevisionId: previousRow.id,
+      // A staged revision is re-indexed before activation, so it owns its
+      // own physical row set.
+      dataRevisionId: id,
       error: null,
       createdAt: now,
       activatedAt: null,
@@ -521,11 +528,11 @@ export class RagConfigurationService {
   /**
    * Implements the "apply-immediately" fast path for query-only changes: no
    * chunk or embedding regenerates. A new, immutable revision row is created
-   * (preserving the "revisions are immutable" invariant for the *previous*
-   * revision's frozen configuration snapshot), and the existing index rows
-   * are re-pointed to it in a single bulk UPDATE per table — far cheaper
-   * than re-chunking/re-embedding, and correct because, by construction,
-   * only query-only paths (topK, RRF weights, retrieval mode, ...) changed.
+   * that *shares* its predecessor's physical row set by inheriting its
+   * `dataRevisionId` — index rows are never moved or copied, so activation
+   * is a pure pointer flip, far cheaper than re-chunking/re-embedding, and
+   * correct because, by construction, only query-only paths (topK, RRF
+   * weights, retrieval mode, ...) changed.
    */
   private async applyImmediateRevision(
     profileRow: RagProfileRow,
@@ -548,17 +555,15 @@ export class RagConfigurationService {
         configurationHash: hashConfiguration(proposed),
         changeImpact: diff.impact,
         previousRevisionId: activeRow.id,
+        dataRevisionId: activeRow.dataRevisionId,
         error: null,
         createdAt: now,
         activatedAt: now,
         failedAt: null,
       });
-      await this.repointIndexRows(manager, activeRow.id, newRevisionId);
       await manager.update(this.revisionRepo.target, { id: activeRow.id }, { status: RagRevisionStatus.ARCHIVED });
       await manager.update(this.profileRepo.target, { id: profileRow.id }, { activeRevisionId: newRevisionId, updatedAt: now });
     });
-
-    await this.repointPostgresIndexes(activeRow.id, newRevisionId, proposed);
 
     const revision = await this.getRevision(profileRow.name, newRevisionId);
     this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_CREATED, {
@@ -617,14 +622,12 @@ export class RagConfigurationService {
   }
 
   /**
-   * `dataRevisionId` is the revision whose rows will actually serve searches
-   * after activation — it differs from `revisionRow.id` only during a
-   * rollback that re-points rows back from a query-only successor.
+   * Validates the index a revision would serve after activation. Counts run
+   * against the revision's *data* revision — the revision whose physical
+   * rows it serves, which differs from its own id for query-only revisions.
    */
-  private async validateIndexConsistency(
-    revisionRow: RagProfileRevisionRow,
-    dataRevisionId: string = revisionRow.id,
-  ): Promise<void> {
+  private async validateIndexConsistency(revisionRow: RagProfileRevisionRow): Promise<void> {
+    const dataRevisionId = revisionRow.dataRevisionId;
     const configuration = revisionRow.configuration as RagProfileConfiguration;
     if (!configuration.retrieval.embedding) return;
 
@@ -658,64 +661,6 @@ export class RagConfigurationService {
   }
 
   /**
-   * Determines whether activating `targetRow` requires re-pointing index rows
-   * back from the currently active revision (rollback across a query-only
-   * lineage — the inverse of `applyImmediateRevision`'s bulk re-point).
-   * Returns the revision id to re-point from, or `null` when the target owns
-   * its rows (or the lineage isn't provably query-only, in which case the
-   * normal consistency validation decides).
-   */
-  private async resolveRepointSource(
-    profileRow: RagProfileRow,
-    targetRow: RagProfileRevisionRow,
-  ): Promise<string | null> {
-    const activeId = profileRow.activeRevisionId;
-    if (!activeId || activeId === targetRow.id) return null;
-    const targetDocuments = await this.documentRepo.count({ where: { profileRevisionId: targetRow.id } });
-    if (targetDocuments > 0) return null;
-    const activeDocuments = await this.documentRepo.count({ where: { profileRevisionId: activeId } });
-    if (activeDocuments === 0) return null;
-
-    // Walk the previous-revision chain from the active revision back to the
-    // target. Every revision on the way (including the active one, excluding
-    // the target) must be a query-only change, otherwise the active rows were
-    // built under a different indexing configuration and cannot serve the
-    // target revision.
-    let cursor: RagProfileRevisionRow | null = await this.revisionRepo.findOne({ where: { id: activeId } });
-    for (let hops = 0; cursor && hops < 1000; hops += 1) {
-      const impact = cursor.changeImpact as RagChangeImpact;
-      if (impact !== RagChangeImpact.NONE && impact !== RagChangeImpact.QUERY_ONLY) return null;
-      if (cursor.previousRevisionId === targetRow.id) return activeId;
-      cursor = cursor.previousRevisionId
-        ? await this.revisionRepo.findOne({ where: { id: cursor.previousRevisionId } })
-        : null;
-    }
-    return null;
-  }
-
-  /**
-   * Bulk re-points every index row (documents, chunks, embeddings, and the
-   * SQLite FTS rows) from one revision to another, inside the caller's
-   * transaction — so a crash can never leave the FTS index pointing at a
-   * revision the relational rows have already left.
-   */
-  private async repointIndexRows(
-    manager: EntityManager,
-    fromRevisionId: string,
-    toRevisionId: string,
-  ): Promise<void> {
-    await manager.update(this.documentRepo.target, { profileRevisionId: fromRevisionId }, { profileRevisionId: toRevisionId });
-    await manager.update(this.chunkRepo.target, { profileRevisionId: fromRevisionId }, { profileRevisionId: toRevisionId });
-    await manager.update(this.chunkEmbeddingRepo.target, { profileRevisionId: fromRevisionId }, { profileRevisionId: toRevisionId });
-    if (this.schemaService.isSqlite()) {
-      await manager.query(
-        `UPDATE "${this.schemaService.ftsTableName()}" SET profile_revision_id = ? WHERE profile_revision_id = ?`,
-        [toRevisionId, fromRevisionId],
-      );
-    }
-  }
-
-  /**
    * Permanently deletes every index row (documents, chunks, embeddings, and
    * the SQLite FTS rows) one revision owns, inside the caller's transaction.
    * Shared by `deleteProfile` and `cleanupArchivedRevisions`; the caller is
@@ -731,31 +676,6 @@ export class RagConfigurationService {
         `DELETE FROM "${this.schemaService.ftsTableName()}" WHERE profile_revision_id = ?`,
         [revisionId],
       );
-    }
-  }
-
-  /** Postgres-only follow-up to `repointIndexRows`: swap the per-revision partial indexes. Best-effort DDL, so it runs after the row transaction commits. */
-  private async repointPostgresIndexes(
-    oldRevisionId: string,
-    newRevisionId: string,
-    configuration: RagProfileConfiguration,
-  ): Promise<void> {
-    if (!this.schemaService.isPostgres()) return;
-
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    try {
-      const language = configuration.retrieval.lexical?.language ?? 'simple';
-      await this.schemaService.ensureLexicalIndexForRevision(queryRunner, newRevisionId, language);
-      await this.schemaService.dropIndexIfExists(queryRunner, this.schemaService.lexicalIndexName(oldRevisionId, language));
-
-      if (configuration.retrieval.embedding) {
-        const dims = configuration.retrieval.embedding.dimensions;
-        await this.schemaService.ensureVectorIndexForRevision(queryRunner, newRevisionId, dims);
-        await this.schemaService.dropIndexIfExists(queryRunner, this.schemaService.vectorIndexName(oldRevisionId, dims));
-      }
-    } finally {
-      await queryRunner.release();
     }
   }
 

@@ -98,6 +98,11 @@ export function createEntitySchemas(
         nullable: true,
         name: 'previous_revision_id',
       },
+      dataRevisionId: {
+        type: 'varchar',
+        length: 36,
+        name: 'data_revision_id',
+      },
       error: { type: 'simple-json', nullable: true },
       createdAt: { type: timestampType, name: 'created_at', createDate: true },
       activatedAt: { type: timestampType, name: 'activated_at', nullable: true },

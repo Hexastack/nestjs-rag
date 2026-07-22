@@ -10,6 +10,7 @@ import { createSqliteTestContext, SqliteTestContext } from '../test-utils/sqlite
 function lexicalRevision(id: string, overrides: Partial<any> = {}) {
   return {
     id,
+    dataRevisionId: id,
     profileName: 'default',
     configuration: {
       name: 'default',

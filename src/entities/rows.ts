@@ -25,6 +25,14 @@ export interface RagProfileRevisionRow {
   configurationHash: string;
   changeImpact: string;
   previousRevisionId: string | null;
+  /**
+   * Id of the revision that actually *built* the index rows this revision
+   * serves. Revisions that indexed their own rows reference themselves;
+   * query-only (apply-immediately) revisions inherit their predecessor's
+   * value, so a whole query-only lineage shares one physical row set and
+   * activation/rollback never has to move rows.
+   */
+  dataRevisionId: string;
   error: unknown;
   createdAt: Date;
   activatedAt: Date | null;

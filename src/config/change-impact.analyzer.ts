@@ -150,7 +150,7 @@ export function analyzeConfigurationChange(
   // cover (directly or via an ancestor, e.g. `retrieval.embedding.*` under
   // `retrieval.embedding`) is classified REINDEX_REQUIRED rather than
   // silently ignored — otherwise a future configuration field added without
-  // a table entry could slip through `apply-immediately` and re-point index
+  // a table entry could slip through `apply-immediately` and serve index
   // rows built under different settings.
   const allChangedPaths: string[] = [];
   collectChangedLeafPaths(current, proposed, '', allChangedPaths);

@@ -164,7 +164,7 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       expect((await service.getActiveRevision('default')).id).toBe(result.revision.id);
     });
 
-    it('re-points existing chunks/documents to the new revision instead of re-indexing', async () => {
+    it('shares the existing index rows via dataRevisionId instead of moving or re-indexing them', async () => {
       const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
       const originalRevisionId = profile.activeRevisionId!;
       await ctx.repos.document.save({
@@ -190,14 +190,20 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
         { applyStrategy: 'apply-immediately' },
       );
 
-      const documentsUnderNewRevision = await ctx.repos.document.count({
-        where: { profileRevisionId: result.revision.id },
-      });
-      const documentsUnderOldRevision = await ctx.repos.document.count({
-        where: { profileRevisionId: originalRevisionId },
-      });
-      expect(documentsUnderNewRevision).toBe(1);
-      expect(documentsUnderOldRevision).toBe(0);
+      // Rows stay with the revision that built them; the new revision serves
+      // them by reference.
+      expect(result.revision.dataRevisionId).toBe(originalRevisionId);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: originalRevisionId } })).toBe(1);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: result.revision.id } })).toBe(0);
+    });
+
+    it('chained query-only revisions all reference the original indexing revision', async () => {
+      const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const originalRevisionId = profile.activeRevisionId!;
+      const first = await service.updateProfile('default', { searchDefaults: { topK: 10 } }, { applyStrategy: 'apply-immediately' });
+      const second = await service.updateProfile('default', { searchDefaults: { topK: 20 } }, { applyStrategy: 'apply-immediately' });
+      expect(first.revision.dataRevisionId).toBe(originalRevisionId);
+      expect(second.revision.dataRevisionId).toBe(originalRevisionId);
     });
 
     it('rejects a change that requires re-indexing', async () => {
@@ -336,6 +342,39 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
       await expect(service.rollback('default', staged.revision.id)).rejects.toThrow(RagProfileRevisionError);
     });
+
+    it('serves the shared row set when rolling back to an intermediate query-only revision after an earlier rollback', async () => {
+      // Regression: A (indexed) -> B (query-only) -> C (query-only), rollback
+      // to A, then rollback to B. Under the old row re-pointing scheme the
+      // lineage resolver only walked backward from the active revision, so B
+      // activated with an empty index. Now B references A's rows directly.
+      const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const revisionA = profile.activeRevisionId!;
+      await ctx.repos.document.save({
+        id: 'doc-1',
+        profileName: 'default',
+        profileRevisionId: revisionA,
+        sourceName: 'direct',
+        sourceId: 'x',
+        externalId: 'x',
+        namespace: null,
+        content: 'hello',
+        contentHash: 'h',
+        indexingHash: 'h',
+        sourceUpdatedAt: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const revisionB = (await service.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' })).revision;
+      await service.updateProfile('default', { searchDefaults: { topK: 6 } }, { applyStrategy: 'apply-immediately' });
+
+      await service.rollback('default', revisionA);
+      const restored = await service.rollback('default', revisionB.id);
+
+      expect(restored.dataRevisionId).toBe(revisionA);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: revisionA } })).toBe(1);
+    });
   });
 
   describe('concurrency control', () => {
@@ -407,14 +446,50 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
   });
 
   describe('cleanupArchivedRevisions', () => {
-    it('purges old archived revisions beyond the retention count and rollback then fails descriptively', async () => {
+    const readyReindexResult = (revisionId: string): RagProfileReindexResult => ({
+      profileName: 'default',
+      revisionId,
+      status: RagOperationStatus.COMPLETED,
+      sources: [],
+      documentsIndexed: 1,
+      chunksCreated: 1,
+      embeddingsCreated: 0,
+      failures: 0,
+      readyForActivation: true,
+    });
+
+    it('purges archived revisions beyond the retention count and rollback then fails descriptively', async () => {
       const initial = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
-      await service.updateProfile('default', { searchDefaults: { topK: 1 } }, { applyStrategy: 'apply-immediately' });
-      await service.updateProfile('default', { searchDefaults: { topK: 2 } }, { applyStrategy: 'apply-immediately' });
+      indexingService.reindexRevision.mockImplementation(
+        async (_profileName: string, revisionId: string) => readyReindexResult(revisionId),
+      );
+      // Two re-index boundaries: each revision owns its own row set, so the
+      // archived ones are not referenced by anything and can be purged.
+      await service.updateProfile('default', { chunking: { chunkSize: 300 } }, { applyStrategy: 'reindex-and-activate' });
+      await service.updateProfile('default', { chunking: { chunkSize: 350 } }, { applyStrategy: 'reindex-and-activate' });
 
       const { deleted } = await service.cleanupArchivedRevisions('default', { keep: 0 });
       expect(deleted).toContain(initial.activeRevisionId);
       await expect(service.rollback('default', initial.activeRevisionId!)).rejects.toThrow(RagRevisionNotFoundError);
+    });
+
+    it('never purges a revision whose row set another retained revision still references', async () => {
+      const initial = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const originalRevisionId = initial.activeRevisionId!;
+      // Query-only updates: the active revision serves the original
+      // revision's rows via dataRevisionId, so the original must survive
+      // cleanup even with keep: 0. The intermediate query-only revision owns
+      // nothing and is purged.
+      const intermediate = await service.updateProfile('default', { searchDefaults: { topK: 1 } }, { applyStrategy: 'apply-immediately' });
+      await service.updateProfile('default', { searchDefaults: { topK: 2 } }, { applyStrategy: 'apply-immediately' });
+
+      const { deleted } = await service.cleanupArchivedRevisions('default', { keep: 0 });
+      expect(deleted).toContain(intermediate.revision.id);
+      expect(deleted).not.toContain(originalRevisionId);
+
+      // The original revision's rows are intact, so rolling back to it works.
+      const rolledBack = await service.rollback('default', originalRevisionId);
+      expect(rolledBack.status).toBe(RagRevisionStatus.ACTIVE);
     });
   });
 

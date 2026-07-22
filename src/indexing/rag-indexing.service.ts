@@ -39,6 +39,13 @@ import { newId } from '../utils/id.util';
 interface RevisionContext {
   profileName: string;
   revisionId: string;
+  /**
+   * Revision id that owns the physical index rows (documents, chunks,
+   * embeddings, FTS). Differs from `revisionId` when the revision is a
+   * query-only (apply-immediately) descendant of the revision that actually
+   * indexed — every physical read/write below must use this id.
+   */
+  dataRevisionId: string;
   configuration: RagProfileConfiguration;
 }
 
@@ -138,7 +145,7 @@ export class RagIndexingService {
     }
     const revision = await this.resolveRevisionContext(binding.profileName);
     if (record.deletedAt) {
-      await this.deleteDocument(revision.revisionId, sourceName, record.externalId);
+      await this.deleteDocument(revision.dataRevisionId, sourceName, record.externalId);
       return {
         documentId: '',
         sourceName,
@@ -165,14 +172,15 @@ export class RagIndexingService {
   async removeSourceRecord(sourceName: string, sourceId: string | number): Promise<void> {
     const binding = await this.getBindingOrThrow(sourceName);
     const revision = await this.resolveRevisionContext(binding.profileName);
-    await this.deleteDocument(revision.revisionId, sourceName, String(sourceId));
+    await this.deleteDocument(revision.dataRevisionId, sourceName, String(sourceId));
   }
 
   /**
    * Removes every document a source contributed to a profile's *active*
    * revision (used when a source is reassigned to a different profile, so the
-   * old profile stops serving its content). Archived revisions are left
-   * untouched — like all deletes, this is revision-scoped.
+   * old profile stops serving its content). Row sets built by other
+   * re-indexes are left untouched — like all deletes, this is scoped to the
+   * active revision's data revision.
    */
   async removeSourceDocuments(profileName: string, sourceName: string): Promise<{ documentsRemoved: number }> {
     let revision: RevisionContext;
@@ -183,10 +191,10 @@ export class RagIndexingService {
       return { documentsRemoved: 0 };
     }
     const documents = await this.documentRepo.find({
-      where: { profileRevisionId: revision.revisionId, sourceName },
+      where: { profileRevisionId: revision.dataRevisionId, sourceName },
     });
     for (const document of documents) {
-      await this.deleteDocument(revision.revisionId, sourceName, document.externalId);
+      await this.deleteDocument(revision.dataRevisionId, sourceName, document.externalId);
     }
     return { documentsRemoved: documents.length };
   }
@@ -222,7 +230,7 @@ export class RagIndexingService {
       await this.embeddingRegistry.validateConfiguration(configuration.retrieval.embedding);
     }
 
-    const context: RevisionContext = { profileName, revisionId, configuration };
+    const context: RevisionContext = { profileName, revisionId, dataRevisionId: revision.dataRevisionId, configuration };
 
     const allBindings = await this.sourceBindingRepo.find({ where: { profileName } });
     const targetBindings = options.sources
@@ -306,7 +314,7 @@ export class RagIndexingService {
 
     let since: Date | undefined;
     if (!options.full && wiring.synchronization?.incremental) {
-      since = await this.lastSyncedAt(revision.revisionId, sourceName);
+      since = await this.lastSyncedAt(revision.dataRevisionId, sourceName);
     }
 
     const results: RagIngestResult[] = [];
@@ -320,7 +328,7 @@ export class RagIndexingService {
       for (const record of page.records) {
         try {
           if (record.deletedAt) {
-            await this.deleteDocument(revision.revisionId, sourceName, record.externalId);
+            await this.deleteDocument(revision.dataRevisionId, sourceName, record.externalId);
             documentsRemoved += 1;
             continue;
           }
@@ -357,16 +365,16 @@ export class RagIndexingService {
     boundSourceNames: Set<string>,
     options: RagProfileReindexOptions,
   ): Promise<RagSourceSyncResult[]> {
-    let activeRevisionId: string;
+    let activeDataRevisionId: string;
     try {
       const active = await this.configurationService.getActiveRevision(revision.profileName);
-      activeRevisionId = active.id;
+      activeDataRevisionId = active.dataRevisionId;
     } catch {
       return []; // no active revision yet — nothing to carry forward
     }
-    if (activeRevisionId === revision.revisionId) return [];
+    if (activeDataRevisionId === revision.dataRevisionId) return [];
 
-    const documents = await this.documentRepo.find({ where: { profileRevisionId: activeRevisionId } });
+    const documents = await this.documentRepo.find({ where: { profileRevisionId: activeDataRevisionId } });
     const unbound = documents.filter((d) => !boundSourceNames.has(d.sourceName));
     if (unbound.length === 0) return [];
 
@@ -448,12 +456,12 @@ export class RagIndexingService {
     const effectiveChunking = resolveEffectiveChunking(revision.configuration.chunking, options.chunkingOverrides);
     const indexingHash = hashIndexingInputs({
       contentHash,
-      profileRevisionId: revision.revisionId,
+      profileRevisionId: revision.dataRevisionId,
       chunkingOverrides: effectiveChunking,
     });
 
     const existing = await this.documentRepo.findOne({
-      where: { profileRevisionId: revision.revisionId, sourceName, externalId: record.externalId },
+      where: { profileRevisionId: revision.dataRevisionId, sourceName, externalId: record.externalId },
     });
     if (existing && existing.indexingHash === indexingHash && !options.replaceExisting) {
       return {
@@ -498,7 +506,7 @@ export class RagIndexingService {
       await manager.save(this.documentRepo.target, {
         id: documentId,
         profileName: revision.profileName,
-        profileRevisionId: revision.revisionId,
+        profileRevisionId: revision.dataRevisionId,
         sourceName,
         sourceId,
         externalId: record.externalId,
@@ -515,7 +523,7 @@ export class RagIndexingService {
       const chunkRows: RagChunkRow[] = chunks.map((chunk, index) => ({
         id: newId(),
         profileName: revision.profileName,
-        profileRevisionId: revision.revisionId,
+        profileRevisionId: revision.dataRevisionId,
         documentId,
         chunkIndex: index,
         content: chunk.text,
@@ -532,7 +540,7 @@ export class RagIndexingService {
         const embeddingRows: RagChunkEmbeddingRow[] = chunkRows.map((chunkRow, i) => ({
           id: newId(),
           profileName: revision.profileName,
-          profileRevisionId: revision.revisionId,
+          profileRevisionId: revision.dataRevisionId,
           chunkId: chunkRow.id,
           providerId: embedding.providerId,
           modelId: embedding.modelId,
@@ -551,7 +559,7 @@ export class RagIndexingService {
         for (const row of chunkRows) {
           await manager.query(
             `INSERT INTO "${ftsTable}" (content, chunk_id, profile_revision_id, document_id, source_name, namespace) VALUES (?, ?, ?, ?, ?, ?)`,
-            [row.content, row.id, revision.revisionId, documentId, sourceName, record.namespace ?? null],
+            [row.content, row.id, revision.dataRevisionId, documentId, sourceName, record.namespace ?? null],
           );
         }
       }
@@ -572,10 +580,12 @@ export class RagIndexingService {
 
   /**
    * Deletes a document (and its chunks/embeddings/FTS rows) from *one*
-   * revision only. Archived revisions keep their copy until
-   * `cleanupArchivedRevisions` purges them — deletes are revision-scoped for
-   * the same reason writes are: revisions are immutable, isolated snapshots,
-   * and rollback must be able to restore what a revision indexed.
+   * physical row set only — the one owned by `profileRevisionId` (always a
+   * *data* revision id). Row sets built by other re-indexes keep their copy
+   * until `cleanupArchivedRevisions` purges them, so rollback across a
+   * re-index boundary restores exactly what that revision indexed. Query-only
+   * revisions that share this data revision see the delete immediately: a
+   * query-only lineage is one live corpus, not a chain of snapshots.
    */
   private async deleteDocument(profileRevisionId: string, sourceName: string, externalId: string): Promise<void> {
     const documents = await this.documentRepo.find({ where: { profileRevisionId, sourceName, externalId } });
@@ -630,15 +640,15 @@ export class RagIndexingService {
     // `CREATE INDEX IF NOT EXISTS` round-trips on every single ingest add up;
     // once ensured for a (revision, language[, dimensions]) combination in
     // this process, skip the DDL entirely.
-    const cacheKey = `${revision.revisionId}:${language}:${dimensions ?? 'none'}`;
+    const cacheKey = `${revision.dataRevisionId}:${language}:${dimensions ?? 'none'}`;
     if (this.ensuredIndexKeys.has(cacheKey)) return;
 
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     try {
-      await this.schemaService.ensureLexicalIndexForRevision(queryRunner, revision.revisionId, language);
+      await this.schemaService.ensureLexicalIndexForRevision(queryRunner, revision.dataRevisionId, language);
       if (dimensions !== undefined) {
-        await this.schemaService.ensureVectorIndexForRevision(queryRunner, revision.revisionId, dimensions);
+        await this.schemaService.ensureVectorIndexForRevision(queryRunner, revision.dataRevisionId, dimensions);
       }
       this.ensuredIndexKeys.add(cacheKey);
     } finally {
@@ -650,7 +660,12 @@ export class RagIndexingService {
     const revision = revisionId
       ? await this.configurationService.getRevision(profileName, revisionId)
       : await this.configurationService.getActiveRevision(profileName);
-    return { profileName, revisionId: revision.id, configuration: revision.configuration };
+    return {
+      profileName,
+      revisionId: revision.id,
+      dataRevisionId: revision.dataRevisionId,
+      configuration: revision.configuration,
+    };
   }
 
   private resolveProvider(wiring: RagResolvedSourceWiring): RagSourceProvider {

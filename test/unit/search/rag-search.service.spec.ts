@@ -73,8 +73,8 @@ describe('RagSearchService', () => {
       searchDefaults: { topK: 10, candidateLimit: 50, minScore: 0 },
     };
     configurationService = {
-      getActiveRevision: jest.fn().mockResolvedValue({ id: revisionId, profileName: 'default', configuration }),
-      getRevision: jest.fn().mockResolvedValue({ id: revisionId, profileName: 'default', configuration }),
+      getActiveRevision: jest.fn().mockResolvedValue({ id: revisionId, dataRevisionId: revisionId, profileName: 'default', configuration }),
+      getRevision: jest.fn().mockResolvedValue({ id: revisionId, dataRevisionId: revisionId, profileName: 'default', configuration }),
     };
     const embeddingService = { embedQuery: jest.fn().mockResolvedValue([1, 0, 0]) };
     const service = new RagSearchService(
@@ -188,7 +188,7 @@ describe('RagSearchService', () => {
         searchDefaults: { topK: 10, candidateLimit: 50, minScore: 0 },
       };
       const configurationServiceStub = {
-        getActiveRevision: jest.fn().mockResolvedValue({ id: revisionId, profileName: 'default', configuration }),
+        getActiveRevision: jest.fn().mockResolvedValue({ id: revisionId, dataRevisionId: revisionId, profileName: 'default', configuration }),
         getRevision: jest.fn(),
       };
       const embeddingService = { embedQuery: jest.fn().mockResolvedValue([1, 0, 0]) };

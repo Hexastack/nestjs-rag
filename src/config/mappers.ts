@@ -27,6 +27,7 @@ export function rowToRevision(row: RagProfileRevisionRow): RagProfileRevision {
     activatedAt: row.activatedAt ?? undefined,
     failedAt: row.failedAt ?? undefined,
     previousRevisionId: row.previousRevisionId ?? undefined,
+    dataRevisionId: row.dataRevisionId,
     error: (row.error as RagSerializedError | null) ?? undefined,
   };
 }

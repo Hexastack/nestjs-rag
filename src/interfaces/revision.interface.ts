@@ -31,5 +31,13 @@ export interface RagProfileRevision {
   activatedAt?: Date;
   failedAt?: Date;
   previousRevisionId?: string;
+  /**
+   * Id of the revision whose physical index rows (documents, chunks,
+   * embeddings) this revision serves. Equal to `id` for revisions that were
+   * indexed themselves; for query-only (apply-immediately) revisions it
+   * points to the ancestor that last re-indexed, since query-only changes
+   * share that ancestor's row set instead of copying or moving it.
+   */
+  dataRevisionId: string;
   error?: RagSerializedError;
 }

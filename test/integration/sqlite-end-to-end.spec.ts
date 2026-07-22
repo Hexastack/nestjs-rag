@@ -205,7 +205,7 @@ describe('RAG integration (SQLite, lexical-only)', () => {
     await app.close();
   });
 
-  it('still serves indexed content after rolling back across an apply-immediately revision (rows are re-pointed back)', async () => {
+  it('still serves indexed content after rolling back across an apply-immediately revision (rows are shared, never moved)', async () => {
     const app = await buildApp();
     const ragService = app.get(RagService);
     const configurationService = app.get(RagConfigurationService);
@@ -213,16 +213,46 @@ describe('RAG integration (SQLite, lexical-only)', () => {
     await ragService.ingest({ externalId: 'doc-rb', content: 'Rollback subject content about telescopes.' });
     const initial = await configurationService.getActiveRevision('default');
 
-    // Query-only change: index rows get bulk re-pointed to the new revision.
-    await configurationService.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' });
+    // Query-only change: the new revision serves the same physical rows via
+    // its dataRevisionId — nothing is moved.
+    const updated = await configurationService.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' });
+    expect(updated.revision.dataRevisionId).toBe(initial.dataRevisionId);
     expect((await ragService.search('telescopes')).length).toBeGreaterThan(0);
 
-    // Rolling back must re-point the rows back to the (empty) archived
-    // revision — not silently activate an empty index.
+    // Rolling back is a pure pointer flip — never a silent empty index.
     await configurationService.rollback('default', initial.id);
     const results = await ragService.search('telescopes');
     expect(results.length).toBeGreaterThan(0);
     expect(results[0].chunk.documentId).toBeDefined();
+    await app.close();
+  });
+
+  it('serves current content after rolling back to an intermediate query-only revision, including documents ingested after it was archived', async () => {
+    const app = await buildApp();
+    const ragService = app.get(RagService);
+    const configurationService = app.get(RagConfigurationService);
+
+    // A (indexed) -> B (query-only) -> C (query-only): one shared live corpus.
+    await ragService.ingest({ externalId: 'doc-a', content: 'Original article about volcanoes.' });
+    const revisionA = await configurationService.getActiveRevision('default');
+    const revisionB = (await configurationService.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' })).revision;
+    await configurationService.updateProfile('default', { searchDefaults: { topK: 6 } }, { applyStrategy: 'apply-immediately' });
+
+    // Mutate the shared corpus while C is active.
+    await ragService.ingest({ externalId: 'doc-late', content: 'Late-breaking notes about glaciers.' });
+
+    // Roll back past B to A, then forward to B — the scenario that used to
+    // activate an empty index because the old lineage resolver only walked
+    // backward from the active revision.
+    await configurationService.rollback('default', revisionA.id);
+    expect((await ragService.search('volcanoes')).length).toBeGreaterThan(0);
+
+    const restoredB = await configurationService.rollback('default', revisionB.id);
+    expect(restoredB.dataRevisionId).toBe(revisionA.dataRevisionId);
+    // The query-only lineage shares one live corpus: B serves both the
+    // original document and the one ingested while C was active.
+    expect((await ragService.search('volcanoes')).length).toBeGreaterThan(0);
+    expect((await ragService.search('glaciers')).length).toBeGreaterThan(0);
     await app.close();
   });
 

@@ -76,6 +76,9 @@ export class RagSearchService {
       ? await this.configurationService.getRevision(profileName, options.revisionId)
       : await this.configurationService.getActiveRevision(profileName);
     const configuration = revision.configuration;
+    // Physical rows live under the revision that built them; query-only
+    // revisions reference their indexing ancestor via dataRevisionId.
+    const dataRevisionId = revision.dataRevisionId;
     const mode = options.mode ?? configuration.retrieval.defaultMode;
 
     const topK = options.topK ?? configuration.searchDefaults?.topK ?? RAG_DEFAULT_SEARCH_DEFAULTS.topK;
@@ -91,7 +94,7 @@ export class RagSearchService {
 
     if (mode === RagRetrievalMode.LEXICAL || mode === RagRetrievalMode.HYBRID) {
       lexicalHits = await this.lexicalAdapter.search({
-        profileRevisionId: revision.id,
+        profileRevisionId: dataRevisionId,
         query,
         language: configuration.retrieval.lexical?.language,
         namespaces,
@@ -113,7 +116,7 @@ export class RagSearchService {
       }
       const queryVector = await this.embeddingService.embedQuery(query, configuration.retrieval.embedding);
       embeddingHits = await this.vectorAdapter.search({
-        profileRevisionId: revision.id,
+        profileRevisionId: dataRevisionId,
         queryVector,
         dimensions: configuration.retrieval.embedding.dimensions,
         namespaces,

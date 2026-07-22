@@ -26,7 +26,7 @@ Always run `npm test`, lint, and the typecheck before considering a change done.
 
 ## Architecture in one paragraph
 
-`RagModule.forRoot()/forRootAsync()` carries **static infrastructure only** (database type/prefix, schema flags, embedding provider *factories*, source wiring). Everything operational — embedding provider/model/dimensions, chunking, hybrid weights, search defaults — lives in **profile revisions**, persisted rows managed at runtime through `RagConfigurationService`. Every document/chunk/embedding row is tagged with a `profileRevisionId`; search only ever reads one revision. Changing indexing-affecting settings creates a new revision that must be re-indexed and activated; query-only changes are applied by bulk re-pointing rows to a new revision.
+`RagModule.forRoot()/forRootAsync()` carries **static infrastructure only** (database type/prefix, schema flags, embedding provider *factories*, source wiring). Everything operational — embedding provider/model/dimensions, chunking, hybrid weights, search defaults — lives in **profile revisions**, persisted rows managed at runtime through `RagConfigurationService`. Every document/chunk/embedding row is tagged with a `profileRevisionId`; search only ever reads one revision. Changing indexing-affecting settings creates a new revision that must be re-indexed and activated; query-only changes create a new revision that shares its predecessor's rows via `dataRevisionId` — rows are never moved or copied.
 
 Key services (all in `src/`):
 
@@ -40,14 +40,14 @@ Key services (all in `src/`):
 
 ## Invariants — do not break these
 
-1. **Revisions are immutable and isolated.** Writes *and deletes* are scoped to one `profileRevisionId`. Archived revisions keep their data until `cleanupArchivedRevisions` purges it; rollback must restore exactly what a revision indexed. `apply-immediately` bulk re-points rows forward; rollback across a query-only lineage re-points them back (see `resolveRepointSource`).
+1. **Index rows belong to the revision that built them.** Every revision carries a `dataRevisionId` — itself for revisions produced by a re-index, the indexing ancestor for query-only (`apply-immediately`) revisions, which share that ancestor's row set as one *live* corpus. Writes *and deletes* are scoped to one data revision; every physical read/write (indexing, search, consistency validation) must use `dataRevisionId`, never the revision's own id. Activation and rollback are pure pointer flips — no code path may move or copy index rows between revisions. Row sets from other re-indexes keep their data until `cleanupArchivedRevisions` purges them (and cleanup must skip a revision whose rows another retained revision still references), so rollback across a re-index boundary restores exactly what that revision indexed.
 2. **Nothing silently invalidates the index.** Any config path not classified in `change-impact.analyzer.ts`'s `PATH_IMPACT` table is treated as `reindex-required`. If you add a configuration field, add it to that table and to its unit test.
 3. **No credentials or code references in persisted state.** Profile revisions and source bindings store only serializable identifiers/settings — never model instances, API keys, class names, or module paths. Providers and source wiring come exclusively from `forRoot`/bootstrap code.
 4. **SQL safety split:** identifiers (table/column/index names, regconfig, revision ids in DDL) go through the allow-list asserts in `utils/identifier.util.ts` / `utils/uuid.util.ts` before interpolation; *values* are always parameterized. Raw-SQL table references must go through `qualifyTable()`. FTS5 query strings must pass through `sanitizeFtsQuery`.
 5. **Per-source retrieval overrides must stay query-compatible.** Queries are always embedded with the profile revision's config, so overrides of `providerId`/`modelId`/`dimensions`/`providerOptions` are rejected (`assertAllowedSourceRetrievalOverrides`). Don't relax this.
 6. **The `embedding` column is unbounded** (`vector`, no length) on Postgres; vector queries must always filter `profile_revision_id` and `dimensions` before computing distance, and per-(revision, dimensions) partial indexes must match the query's cast expression exactly.
 7. **SQLite supports lexical only.** Embedding/hybrid config is rejected at validation time on SQLite; keep the capability checks in `validate-configuration.ts` in sync with any new retrieval feature.
-8. **The SQLite FTS table must stay consistent with `rag_chunks`.** Every code path that inserts/deletes/re-points chunks must do the matching FTS write *inside the same transaction*. Postgres per-revision index DDL is best-effort and runs after the row transaction commits.
+8. **The SQLite FTS table must stay consistent with `rag_chunks`.** Every code path that inserts or deletes chunks must do the matching FTS write *inside the same transaction*. Postgres per-revision index DDL is best-effort and runs after the row transaction commits.
 
 ## Conventions
 
