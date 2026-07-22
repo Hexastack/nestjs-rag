@@ -51,7 +51,7 @@ Key services (all in `src/`):
 
 ## Conventions
 
-- Public API surface is `RagService` (ingest/sync/search), `RagConfigurationService`, `RagSourceConfigurationService`, plus the registries — exported from `src/index.ts`. Keep the facade thin; logic lives in the internal services.
+- Public API surface is `RagService`, `RagConfigurationService`, `RagSourceConfigurationService`, plus the registries — exported from `src/index.ts`. Keep the facade thin; logic lives in the internal services. `RagService` has two indexing styles: **push** (`ingest`/`ingestMany` — caller supplies content, stored under the `"direct"` or a caller-chosen source name) and **pull** (`syncSource`/`indexSourceRecord`/`removeSourceRecord` — content re-fetched from a registered source's provider, profile taken from the source binding). On re-index, pull content is re-fetched from its origin while push content is re-chunked from `rag_documents.content` — see the README's "Indexing & search API" section before changing either path.
 - Errors: always throw the typed classes from `src/errors/` (e.g. `RagValidationError` takes a string array), never bare `Error` from public paths.
 - Events: emitted via `EventEmitter2` with names from `events/rag-events.ts`; payloads carry ids/statuses/config snapshots — never credentials, raw content, or vectors.
 - Tables use `EntitySchema` (no decorators) built in `entities/schemas.ts`, parameterized by `tablePrefix`. Timestamp columns must use the dialect-correct type (`timestamp` on Postgres, `datetime` on SQLite) — see the comment there before touching column types.

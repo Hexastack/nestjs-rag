@@ -17,7 +17,7 @@ This package **indexes and retrieves**. It deliberately does not do chat complet
 - [Update strategies](#update-strategies)
 - [Change-impact detection](#change-impact-detection)
 - [Sources](#sources)
-- [Direct ingestion & search](#direct-ingestion--search)
+- [Indexing & search API](#indexing--search-api)
 - [Vector dimension strategy](#vector-dimension-strategy)
 - [Capability matrix](#capability-matrix-sqlite-vs-postgresql)
 - [Migrations](#migrations)
@@ -310,10 +310,30 @@ Three rules to be aware of:
 - **`stage` for source overrides takes effect on the next write.** Unlike a staged *profile* revision (which never affects the active index), staged source overrides are persisted on the binding and used by the very next ingest/sync — "stage" here means "persist without immediately re-syncing", not "isolate from the active revision". Re-sync the source to apply them to already-indexed content.
 - **Reassigning a source removes its documents from the old profile.** `assignProfile` (with `stage` or `reindex-and-activate`) deletes the source's documents from the old profile's *active* revision, so the old profile stops serving that content; with `stage`, the content is unavailable until you sync the source under its new profile. Archived revisions are untouched.
 
-## Direct ingestion & search
+## Indexing & search API
+
+`RagService` exposes two ways to get content into the index — **push** (you supply the content) and **pull** (the package re-fetches it from a registered source's origin) — plus search:
+
+| Method | Style | What it does |
+|---|---|---|
+| `ingest(doc, opts?)` | push | Indexes content you assemble yourself. No registered source needed — the document is filed under `doc.sourceName` or the reserved `"direct"` name. Profile from `opts.profileName` (default profile otherwise). |
+| `ingestMany(docs, opts?)` | push | `ingest` once per document (see [Known limitations](#known-limitations)). |
+| `syncSource(name, opts?)` | pull | Pages through **all** records of a registered source via its provider, indexing changes and honoring `deletedAt`. Supports incremental sync. |
+| `indexSourceRecord(name, id)` | pull | Single-record refresh: re-fetches one record from the source's origin (`provider.fetchRecord`), applies the mapping and the source's persisted overrides, and indexes it — or removes it if the record is soft-deleted. The profile always comes from the source's binding. |
+| `removeSourceRecord(name, id)` | pull | Removes one record's document from the source's profile (active revision only — see [Failure recovery](#failure-recovery)). |
+| `reindexProfile` / `reindexRevision` | — | Re-index a staged revision; see [Update strategies](#update-strategies). |
+| `search(query, opts?)` | — | Lexical / embedding / hybrid retrieval, always scoped to one profile revision. |
+
+**When to use which:** `ingest` is for content with no origin inside your database — API payloads, uploaded documents, anything you assemble in code. `indexSourceRecord` is the typical way to react to a *single* entity change (e.g. from a TypeORM subscriber or an `afterSave` hook) so the index stays current without paying for a full `syncSource` sweep; `syncSource` is the bulk counterpart.
+
+**Provenance matters on re-index.** When a profile is re-indexed into a new revision, source-backed documents are re-fetched fresh from their origin, while directly ingested documents are carried forward by re-chunking the copy stored in `rag_documents` — the package has no origin to re-fetch them from. If a direct document's real content changed since you last pushed it, only a new `ingest()` call picks that up.
 
 ```ts
+// push: direct ingestion
 await ragService.ingest({ externalId: 'faq-99', content: 'Fiber installation appointments run Mon–Sat.' });
+
+// pull: refresh one record of a registered source (e.g. from a TypeORM subscriber)
+await ragService.indexSourceRecord('knowledge-articles', article.id);
 
 const results = await ragService.search('installation appointment', {
   profileName: 'customer-support',
