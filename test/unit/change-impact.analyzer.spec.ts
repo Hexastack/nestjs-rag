@@ -40,11 +40,20 @@ describe('analyzeConfigurationChange', () => {
       ['retrieval.hybrid.lexicalWeight', (c: RagProfileConfiguration) => ({ ...c, retrieval: { ...c.retrieval, hybrid: { ...c.retrieval.hybrid, lexicalWeight: 1.5 } } })],
       ['retrieval.hybrid.embeddingWeight', (c: RagProfileConfiguration) => ({ ...c, retrieval: { ...c.retrieval, hybrid: { ...c.retrieval.hybrid, embeddingWeight: 0.5 } } })],
       ['retrieval.defaultMode', (c: RagProfileConfiguration) => ({ ...c, retrieval: { ...c.retrieval, defaultMode: RagRetrievalMode.LEXICAL } })],
+      ['retrieval.embedding.batchSize', (c: RagProfileConfiguration) => ({ ...c, retrieval: { ...c.retrieval, embedding: { ...c.retrieval.embedding!, batchSize: 128 } } })],
     ])('classifies %s as query-only and immediately applicable', (_name, mutate) => {
       const current = baseConfig();
       const result = analyzeConfigurationChange(current, mutate(current));
       expect(result.impact).toBe(RagChangeImpact.QUERY_ONLY);
       expect(result.canApplyImmediately).toBe(true);
+    });
+
+    it('does not escalate a batch-size change through the whole-object retrieval.embedding entry', () => {
+      const current = baseConfig();
+      const proposed = { ...current, retrieval: { ...current.retrieval, embedding: { ...current.retrieval.embedding!, batchSize: 128 } } };
+      const result = analyzeConfigurationChange(current, proposed);
+      expect(result.changedPaths).toEqual(['retrieval.embedding.batchSize']);
+      expect(result.impact).toBe(RagChangeImpact.QUERY_ONLY);
     });
   });
 

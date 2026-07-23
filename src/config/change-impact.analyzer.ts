@@ -101,6 +101,33 @@ function collectChangedLeafPaths(a: unknown, b: unknown, prefix: string, out: st
   }
 }
 
+/**
+ * Direct child keys of `path` that carry their own classification entry
+ * (e.g. `batchSize` under `retrieval.embedding`). The whole-object
+ * comparison for `path` must ignore them: they are classified by their own
+ * entries, and letting them also flip the parent entry would escalate e.g.
+ * a query-only `retrieval.embedding.batchSize` change to the parent's
+ * REINDEX_REQUIRED. The parent entry still catches set↔unset transitions
+ * and changes to keys the table doesn't know about.
+ */
+function childKeysWithOwnEntries(path: string): Set<string> {
+  const keys = new Set<string>();
+  const prefix = `${path}.`;
+  for (const other of Object.keys(PATH_IMPACT)) {
+    if (other.startsWith(prefix)) {
+      keys.add(other.slice(prefix.length).split('.')[0]);
+    }
+  }
+  return keys;
+}
+
+function withoutKeys(value: unknown, keys: Set<string>): unknown {
+  if (keys.size === 0 || !isPlainObject(value)) return value;
+  const copy: Record<string, unknown> = { ...value };
+  for (const key of keys) delete copy[key];
+  return copy;
+}
+
 /** True when `path` or one of its ancestors is covered by the classification table. */
 function isCoveredByKnownPath(path: string): boolean {
   const segments = path.split('.');
@@ -130,8 +157,9 @@ export function analyzeConfigurationChange(
 
   for (const path of Object.keys(PATH_IMPACT)) {
     const segments = path.split('.');
-    const before = get(current, segments);
-    const after = get(proposed, segments);
+    const ownChildEntries = childKeysWithOwnEntries(path);
+    const before = withoutKeys(get(current, segments), ownChildEntries);
+    const after = withoutKeys(get(proposed, segments), ownChildEntries);
     if (!isEqual(before, after)) {
       changedPaths.push(path);
       const impact = PATH_IMPACT[path];
