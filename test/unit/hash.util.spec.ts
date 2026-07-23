@@ -59,4 +59,15 @@ describe('hashIndexingInputs', () => {
     const inputs = { contentHash: hashContent('abc'), profileRevisionId: 'rev-1', chunkingOverrides: { chunkSize: 10 } };
     expect(hashIndexingInputs(inputs)).toEqual(hashIndexingInputs({ ...inputs }));
   });
+
+  it('changes when the source mappingVersion changes', () => {
+    const base = { contentHash: hashContent('abc'), profileRevisionId: 'rev-1' };
+    expect(hashIndexingInputs({ ...base, mappingVersion: 'v1' })).not.toEqual(hashIndexingInputs({ ...base, mappingVersion: 'v2' }));
+    expect(hashIndexingInputs(base)).not.toEqual(hashIndexingInputs({ ...base, mappingVersion: 'v1' }));
+  });
+
+  it('keeps hashes of pre-mappingVersion documents stable when the field is absent', () => {
+    const base = { contentHash: hashContent('abc'), profileRevisionId: 'rev-1' };
+    expect(hashIndexingInputs(base)).toEqual(hashIndexingInputs({ ...base, mappingVersion: undefined }));
+  });
 });

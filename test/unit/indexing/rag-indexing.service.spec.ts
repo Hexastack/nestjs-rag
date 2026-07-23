@@ -234,6 +234,72 @@ describe('RagIndexingService', () => {
       expect(result.failures).toBe(1);
       expect(result.status).toBe(RagOperationStatus.COMPLETED_WITH_ERRORS);
     });
+
+    function swapProvider(records: RagSourceRecord[], wiringOverrides: Record<string, unknown> = {}) {
+      sourceRegistry = new RagSourceRegistry();
+      sourceRegistry.register({
+        name: 'kb',
+        kind: 'provider',
+        provider: new InMemorySourceProvider('kb', records),
+        defaultProfileName: 'default',
+        ...wiringOverrides,
+      } as any);
+      (service as any).sourceRegistry = sourceRegistry;
+      (service as any).providerCache.clear();
+    }
+
+    it('refreshes metadata, namespace, and sourceUpdatedAt when content is unchanged', async () => {
+      const content = 'stable content that never changes between syncs';
+      swapProvider([{ externalId: '1', content, metadata: { tag: 'old' }, namespace: 'ns-old', updatedAt: new Date('2026-01-01') }]);
+      await service.syncSource('kb');
+
+      swapProvider([{ externalId: '1', content, metadata: { tag: 'new' }, namespace: 'ns-new', updatedAt: new Date('2026-02-01') }]);
+      const result = await service.syncSource('kb');
+      expect(result.results[0].skipped).toBe(true);
+      expect(result.results[0].skipReason).toBe('attributes-updated');
+
+      const document = await ctx.repos.document.findOneByOrFail({ externalId: '1' });
+      expect(document.metadata).toEqual({ tag: 'new' });
+      expect(document.namespace).toBe('ns-new');
+      expect(new Date(document.sourceUpdatedAt as Date).toISOString()).toBe(new Date('2026-02-01').toISOString());
+
+      const chunks = await ctx.repos.chunk.find({ where: { documentId: document.id } });
+      expect(chunks.length).toBeGreaterThan(0);
+      for (const chunk of chunks) expect(chunk.metadata).toEqual({ tag: 'new' });
+
+      // SQLite FTS rows denormalize the namespace, so the lexical filter must see the new value too.
+      const ftsRows: Array<{ namespace: string }> = await ctx.dataSource.query(
+        `SELECT namespace FROM "${ctx.schemaService.ftsTableName()}" WHERE document_id = ?`,
+        [document.id],
+      );
+      expect(ftsRows.length).toBeGreaterThan(0);
+      for (const row of ftsRows) expect(row.namespace).toBe('ns-new');
+    });
+
+    it('still reports "unchanged" when nothing at all changed', async () => {
+      const record: RagSourceRecord = { externalId: '1', content: 'identical', metadata: { tag: 'same' }, updatedAt: new Date('2026-01-01') };
+      swapProvider([record]);
+      await service.syncSource('kb');
+      swapProvider([{ ...record }]);
+      const result = await service.syncSource('kb');
+      expect(result.results[0].skipReason).toBe('unchanged');
+    });
+
+    it('re-indexes unchanged content when the source mappingVersion is bumped', async () => {
+      const records: RagSourceRecord[] = [{ externalId: '1', content: 'same content across mapping versions' }];
+      swapProvider(records, { mappingVersion: 'v1' });
+      const first = await service.syncSource('kb');
+      expect(first.documentsIndexed).toBe(1);
+
+      swapProvider(records, { mappingVersion: 'v1' });
+      const unchanged = await service.syncSource('kb');
+      expect(unchanged.documentsIndexed).toBe(0);
+
+      swapProvider(records, { mappingVersion: 'v2' });
+      const bumped = await service.syncSource('kb');
+      expect(bumped.documentsIndexed).toBe(1);
+      expect(bumped.results[0].indexingHash).not.toEqual(first.results[0].indexingHash);
+    });
   });
 
   describe('reindexRevision', () => {

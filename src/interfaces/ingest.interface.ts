@@ -29,6 +29,12 @@ export interface RagIngestResult {
   chunksCreated: number;
   embeddingsCreated: number;
   indexingHash: string;
+  /** True when the document was not re-chunked/re-embedded. */
   skipped: boolean;
+  /**
+   * `"unchanged"` — nothing to do; `"attributes-updated"` — content was
+   * unchanged but metadata/namespace/sourceUpdatedAt were refreshed in
+   * place; `"deleted"` — the source record is tombstoned.
+   */
   skipReason?: string;
 }

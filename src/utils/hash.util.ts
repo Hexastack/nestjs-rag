@@ -43,18 +43,27 @@ export function hashContent(content: string): string {
  * this exact way". Any change to content, chunking, or embedding
  * configuration (including per-operation overrides) changes this hash,
  * which is how the package detects when a direct-ingestion document needs
- * explicit re-indexing after a profile change.
+ * explicit re-indexing after a profile change. A source's `mappingVersion`
+ * participates too, so bumping it forces a re-index of every record even
+ * when the mapped content happens to be byte-identical. Deliberately
+ * excluded: metadata, namespace, and source timestamps — those are cheap
+ * attributes that `indexRecord` refreshes in place without re-embedding.
  */
 export function hashIndexingInputs(parts: {
   contentHash: string;
   profileRevisionId: string;
   chunkingOverrides?: unknown;
+  mappingVersion?: string;
 }): string {
   return sha256Hex(
     canonicalStringify({
       contentHash: parts.contentHash,
       profileRevisionId: parts.profileRevisionId,
       chunkingOverrides: parts.chunkingOverrides ?? null,
+      // Left undefined (dropped by canonicalStringify) rather than null when
+      // absent, so hashes of sources without a mappingVersion — and of all
+      // documents indexed before this field existed — stay stable.
+      mappingVersion: parts.mappingVersion,
     }),
   );
 }

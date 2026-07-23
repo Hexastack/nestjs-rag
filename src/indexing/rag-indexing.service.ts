@@ -33,7 +33,7 @@ import { ChonkieChunkerFactory } from '../chunking/chonkie-chunker.factory';
 import { EntitySourceProvider } from '../source/providers/entity-source.provider';
 import { TableSourceProvider } from '../source/providers/table-source.provider';
 import { RagResolvedSourceWiring, RagSourceRegistry } from '../source/source-registry';
-import { hashContent, hashIndexingInputs } from '../utils/hash.util';
+import { canonicalStringify, hashContent, hashIndexingInputs } from '../utils/hash.util';
 import { newId } from '../utils/id.util';
 
 interface RevisionContext {
@@ -163,6 +163,7 @@ export class RagIndexingService {
     const result = await this.indexRecord(revision, sourceName, record.externalId, record, {
       chunkingOverrides: overrides.chunking,
       retrievalOverrides: overrides.retrieval,
+      mappingVersion: wiring.mappingVersion,
       replaceExisting: true,
     });
     await this.ensureIndexesForRevision(revision);
@@ -330,6 +331,7 @@ export class RagIndexingService {
           const result = await this.indexRecord(revision, sourceName, record.externalId, record, {
             chunkingOverrides: overrides.chunking,
             retrievalOverrides: overrides.retrieval,
+            mappingVersion: wiring.mappingVersion,
             replaceExisting: false,
           });
           results.push(result);
@@ -444,6 +446,7 @@ export class RagIndexingService {
     options: {
       chunkingOverrides?: Partial<RagProfileConfiguration['chunking']>;
       retrievalOverrides?: Partial<RagProfileConfiguration['retrieval']>;
+      mappingVersion?: string;
       replaceExisting: boolean;
     },
   ): Promise<RagIngestResult> {
@@ -453,12 +456,48 @@ export class RagIndexingService {
       contentHash,
       profileRevisionId: revision.dataRevisionId,
       chunkingOverrides: effectiveChunking,
+      mappingVersion: options.mappingVersion,
     });
 
     const existing = await this.documentRepo.findOne({
       where: { profileRevisionId: revision.dataRevisionId, sourceName, externalId: record.externalId },
     });
     if (existing && existing.indexingHash === indexingHash && !options.replaceExisting) {
+      // The hash only guards the expensive work (chunking + embedding).
+      // Metadata, namespace, and the source timestamp can change while the
+      // hash is stable; they are refreshed in place here, without touching
+      // chunk text or embeddings. Persisting `sourceUpdatedAt` is what lets
+      // the incremental-sync watermark (MAX(sourceUpdatedAt)) advance past
+      // records whose content never changes.
+      const metadataChanged = canonicalStringify(existing.metadata ?? null) !== canonicalStringify(record.metadata ?? null);
+      const namespaceChanged = (existing.namespace ?? null) !== (record.namespace ?? null);
+      const updatedAtChanged =
+        (existing.sourceUpdatedAt ? new Date(existing.sourceUpdatedAt).getTime() : null) !==
+        (record.updatedAt ? record.updatedAt.getTime() : null);
+
+      if (metadataChanged || namespaceChanged || updatedAtChanged) {
+        await this.dataSource.transaction(async (manager) => {
+          await manager.update(this.documentRepo.target, { id: existing.id }, {
+            namespace: record.namespace ?? null,
+            metadata: (record.metadata ?? null) as Record<string, unknown>,
+            sourceUpdatedAt: record.updatedAt ?? null,
+            updatedAt: new Date(),
+          });
+          if (metadataChanged) {
+            await manager.update(this.chunkRepo.target, { documentId: existing.id }, {
+              metadata: (record.metadata ?? null) as Record<string, unknown>,
+            });
+          }
+          if (namespaceChanged && this.schemaService.isSqlite()) {
+            // SQLite FTS rows denormalize the namespace (see SqliteFtsLexicalAdapter).
+            await manager.query(`UPDATE "${this.schemaService.ftsTableName()}" SET namespace = ? WHERE document_id = ?`, [
+              record.namespace ?? null,
+              existing.id,
+            ]);
+          }
+        });
+      }
+
       return {
         documentId: existing.id,
         sourceName,
@@ -469,7 +508,7 @@ export class RagIndexingService {
         embeddingsCreated: 0,
         indexingHash,
         skipped: true,
-        skipReason: 'unchanged',
+        skipReason: metadataChanged || namespaceChanged || updatedAtChanged ? 'attributes-updated' : 'unchanged',
       };
     }
 
