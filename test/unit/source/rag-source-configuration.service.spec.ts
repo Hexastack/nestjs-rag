@@ -1,7 +1,9 @@
 import { RagSourceConfigurationService } from '../../../src/source/rag-source-configuration.service';
 import { RagSourceRegistry } from '../../../src/source/source-registry';
-import { RagChunkingStrategy, RagOperationStatus, RagRetrievalMode } from '../../../src/enums';
+import { RagChunkingStrategy, RagDatabaseType, RagOperationStatus, RagRetrievalMode } from '../../../src/enums';
 import { RagReindexRequiredError, RagSourceConfigurationError, RagSourceNotFoundError } from '../../../src/errors';
+import { validateProfileConfigurationStructure } from '../../../src/config/validate-configuration';
+import { RagProfileConfiguration } from '../../../src/interfaces/profile.interface';
 import { createSqliteTestContext, SqliteTestContext } from '../test-utils/sqlite-test-context';
 
 class FakeEventEmitter {
@@ -20,7 +22,10 @@ function fakeActiveRevision(profileName: string) {
     status: 'active',
     configuration: {
       name: profileName,
-      retrieval: { defaultMode: RagRetrievalMode.LEXICAL },
+      retrieval: {
+        defaultMode: RagRetrievalMode.LEXICAL,
+        embedding: { providerId: 'openai', modelId: 'text-embedding-3-small', dimensions: 1536 },
+      },
       chunking: { strategy: RagChunkingStrategy.TOKEN, chunkSize: 200, chunkOverlap: 20 },
     },
     configurationHash: 'hash',
@@ -32,7 +37,7 @@ function fakeActiveRevision(profileName: string) {
 describe('RagSourceConfigurationService', () => {
   let ctx: SqliteTestContext;
   let registry: RagSourceRegistry;
-  let configurationService: { getProfile: jest.Mock; getActiveRevision: jest.Mock };
+  let configurationService: { getProfile: jest.Mock; getActiveRevision: jest.Mock; validateProfile: jest.Mock };
   let indexingService: { syncSource: jest.Mock; removeSourceDocuments: jest.Mock };
   let events: FakeEventEmitter;
   let service: RagSourceConfigurationService;
@@ -58,6 +63,15 @@ describe('RagSourceConfigurationService', () => {
     configurationService = {
       getProfile: jest.fn().mockResolvedValue({ name: 'customer-support' }),
       getActiveRevision: jest.fn().mockImplementation(async (name: string) => fakeActiveRevision(name)),
+      // Runs the real structural validator so override tests exercise genuine
+      // acceptance/rejection instead of a canned answer.
+      validateProfile: jest.fn().mockImplementation(async (configuration: RagProfileConfiguration) => {
+        const structural = validateProfileConfigurationStructure(configuration, {
+          dbType: RagDatabaseType.POSTGRES,
+          vectorColumnEnabled: true,
+        });
+        return { valid: structural.errors.length === 0, errors: structural.errors, warnings: structural.warnings };
+      }),
     };
     indexingService = {
       syncSource: jest.fn().mockResolvedValue({
@@ -236,6 +250,60 @@ describe('RagSourceConfigurationService', () => {
       );
       const source = await service.getSource('articles');
       expect(source.retrievalOverrides).toEqual({ embedding: { batchSize: 25 } });
+    });
+
+    it('rejects a structurally invalid chunking override (overlap >= chunk size)', async () => {
+      await expect(
+        service.updateSourceOverrides('articles', { chunking: { chunkSize: 10 } }, { applyStrategy: 'stage' }),
+      ).rejects.toThrow(/invalid effective configuration/);
+      const source = await service.getSource('articles');
+      expect(source.chunkingOverrides).toBeUndefined();
+    });
+
+    it('rejects a non-positive chunk size override', async () => {
+      await expect(
+        service.updateSourceOverrides('articles', { chunking: { chunkSize: -5 } }, { applyStrategy: 'stage' }),
+      ).rejects.toThrow(/invalid effective configuration/);
+    });
+
+    it('rejects an unknown retrieval mode override', async () => {
+      await expect(
+        service.updateSourceOverrides(
+          'articles',
+          { retrieval: { defaultMode: 'not-a-mode' as any } },
+          { applyStrategy: 'stage' },
+        ),
+      ).rejects.toThrow(/invalid effective configuration/);
+    });
+
+    it('rejects a non-positive embedding batch-size override', async () => {
+      await expect(
+        service.updateSourceOverrides(
+          'articles',
+          { retrieval: { embedding: { batchSize: 0 } as any } },
+          { applyStrategy: 'stage' },
+        ),
+      ).rejects.toThrow(/invalid effective configuration/);
+    });
+
+    it('rejects an empty lexical language override', async () => {
+      await expect(
+        service.updateSourceOverrides(
+          'articles',
+          { retrieval: { lexical: { language: '  ' } } },
+          { applyStrategy: 'stage' },
+        ),
+      ).rejects.toThrow(/invalid effective configuration/);
+    });
+
+    it('rejects a negative hybrid weight override', async () => {
+      await expect(
+        service.updateSourceOverrides(
+          'articles',
+          { retrieval: { defaultMode: RagRetrievalMode.HYBRID, hybrid: { lexicalWeight: -1 } } },
+          { applyStrategy: 'stage' },
+        ),
+      ).rejects.toThrow(/invalid effective configuration/);
     });
 
     it('merges successive overrides rather than replacing them wholesale', async () => {

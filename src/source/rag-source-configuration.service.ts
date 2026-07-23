@@ -6,7 +6,7 @@ import { RagChangeImpact, RagOperationStatus } from '../enums';
 import { RagSourceBindingRow } from '../entities/rows';
 import { RagReindexRequiredError, RagSourceConfigurationError, RagSourceNotFoundError } from '../errors';
 import { RagEventNames, RagSourceProfileChangedEvent } from '../events/rag-events';
-import { RagChunkingOptions, RagRetrievalOptions } from '../interfaces/profile.interface';
+import { RagChunkingOptions, RagProfileConfiguration, RagRetrievalOptions } from '../interfaces/profile.interface';
 import {
   RagSourceProfileUpdateOptions,
   RagSourceProfileUpdateResult,
@@ -17,6 +17,7 @@ import {
 import { RagSourceDescriptor } from '../interfaces/source.interface';
 import { RagConfigurationChangePreview } from '../interfaces/config-api.interface';
 import { RagConfigurationService } from '../config/rag-configuration.service';
+import { resolveEffectiveChunking, resolveEffectiveRetrieval } from '../config/patch-merge.util';
 import { newId } from '../utils/id.util';
 import { assertAllowedSourceRetrievalOverrides, RagSourceRegistry } from './source-registry';
 // Type-only import: see the note in RagConfigurationService for why this
@@ -198,6 +199,7 @@ export class RagSourceConfigurationService {
         ? { ...stored.retrievalOverrides, ...overrides.retrieval }
         : stored.retrievalOverrides,
     };
+    await this.assertValidEffectiveConfiguration(sourceName, binding.profileName, nextStored);
     const preview = await this.previewSourceUpdate(sourceName, {
       chunking: overrides.chunking,
       retrieval: overrides.retrieval,
@@ -261,6 +263,36 @@ export class RagSourceConfigurationService {
       }
       default:
         throw new RagReindexRequiredError([`Unknown apply strategy "${options.applyStrategy}".`]);
+    }
+  }
+
+  /**
+   * Rejects overrides that would produce a structurally invalid *effective*
+   * configuration once merged over the profile's active revision — the same
+   * merge `RagIndexingService` applies at sync time. Embedding-identity
+   * fields are rejected separately by `assertAllowedSourceRetrievalOverrides`;
+   * this catches everything else (invalid chunk sizes/overlaps, batch sizes,
+   * retrieval modes, hybrid weights, lexical languages, ...) that would
+   * otherwise be persisted silently and poison every subsequent sync.
+   */
+  private async assertValidEffectiveConfiguration(
+    sourceName: string,
+    profileName: string,
+    stored: StoredSourceConfiguration,
+  ): Promise<void> {
+    const revision = await this.configurationService.getActiveRevision(profileName);
+    const configuration = revision.configuration;
+    const effective: RagProfileConfiguration = {
+      ...configuration,
+      chunking: resolveEffectiveChunking(configuration.chunking, stored.chunkingOverrides),
+      retrieval: resolveEffectiveRetrieval(configuration.retrieval, stored.retrievalOverrides),
+    };
+    const result = await this.configurationService.validateProfile(effective);
+    if (!result.valid) {
+      throw new RagSourceConfigurationError(
+        `Source "${sourceName}" overrides produce an invalid effective configuration for profile "${profileName}": ` +
+          result.errors.join('; '),
+      );
     }
   }
 
