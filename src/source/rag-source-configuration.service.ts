@@ -4,7 +4,7 @@ import { Repository } from 'typeorm';
 import { RAG_INDEXING_SERVICE, RAG_SOURCE_BINDING_REPOSITORY } from '../constants';
 import { RagChangeImpact, RagOperationStatus } from '../enums';
 import { RagSourceBindingRow } from '../entities/rows';
-import { RagReindexRequiredError, RagSourceNotFoundError } from '../errors';
+import { RagReindexRequiredError, RagSourceConfigurationError, RagSourceNotFoundError } from '../errors';
 import { RagEventNames, RagSourceProfileChangedEvent } from '../events/rag-events';
 import { RagChunkingOptions, RagRetrievalOptions } from '../interfaces/profile.interface';
 import {
@@ -164,9 +164,18 @@ export class RagSourceConfigurationService {
         this.emitProfileChanged(sourceName, previousProfileName, profileName);
         return { sourceName, previousProfileName, newProfileName: profileName, preview };
       case 'reindex-and-activate': {
+        // Index under the new profile first; the binding and the old
+        // profile's documents are only touched once the new copy actually
+        // exists, so a failed sync leaves the old profile serving intact.
+        const reindexResult = await this.syncSourceAsReindexResult(sourceName, profileName);
+        if (!reindexResult.readyForActivation) {
+          throw new RagSourceConfigurationError(
+            `Reassigning source "${sourceName}" to profile "${profileName}" failed during re-indexing ` +
+              `(${reindexResult.failures} failure(s)); the source remains bound to "${previousProfileName}".`,
+          );
+        }
         await this.bindingRepo.update({ sourceName }, { profileName, updatedAt: new Date() });
         this.emitProfileChanged(sourceName, previousProfileName, profileName);
-        const reindexResult = await this.syncSourceAsReindexResult(sourceName, profileName);
         await this.removeFromPreviousProfile(sourceName, previousProfileName);
         return { sourceName, previousProfileName, newProfileName: profileName, preview, reindexResult };
       }

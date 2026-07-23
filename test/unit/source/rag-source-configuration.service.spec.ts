@@ -1,7 +1,7 @@
 import { RagSourceConfigurationService } from '../../../src/source/rag-source-configuration.service';
 import { RagSourceRegistry } from '../../../src/source/source-registry';
 import { RagChunkingStrategy, RagOperationStatus, RagRetrievalMode } from '../../../src/enums';
-import { RagReindexRequiredError, RagSourceNotFoundError } from '../../../src/errors';
+import { RagReindexRequiredError, RagSourceConfigurationError, RagSourceNotFoundError } from '../../../src/errors';
 import { createSqliteTestContext, SqliteTestContext } from '../test-utils/sqlite-test-context';
 
 class FakeEventEmitter {
@@ -147,6 +147,43 @@ describe('RagSourceConfigurationService', () => {
     it('does not remove documents on validate-only', async () => {
       await service.assignProfile('articles', 'customer-support', { applyStrategy: 'validate-only' });
       expect(indexingService.removeSourceDocuments).not.toHaveBeenCalled();
+    });
+
+    it('reindex-and-activate keeps the binding and the old documents when the sync reports FAILED', async () => {
+      indexingService.syncSource.mockResolvedValue({
+        sourceName: 'articles',
+        status: RagOperationStatus.FAILED,
+        recordsProcessed: 2,
+        documentsIndexed: 0,
+        documentsRemoved: 0,
+        chunksCreated: 0,
+        embeddingsCreated: 0,
+        failures: 2,
+        errors: [{ externalId: '1', message: 'embedding provider unavailable' }],
+        results: [],
+      });
+
+      await expect(
+        service.assignProfile('articles', 'customer-support', { applyStrategy: 'reindex-and-activate' }),
+      ).rejects.toThrow(RagSourceConfigurationError);
+
+      const source = await service.getSource('articles');
+      expect(source.profileName).toBe('default');
+      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalled();
+      expect(events.events.some((e) => e.name === 'rag.source.profile.changed')).toBe(false);
+    });
+
+    it('reindex-and-activate keeps the binding and the old documents when the sync throws', async () => {
+      indexingService.syncSource.mockRejectedValue(new Error('provider connection refused'));
+
+      await expect(
+        service.assignProfile('articles', 'customer-support', { applyStrategy: 'reindex-and-activate' }),
+      ).rejects.toThrow('provider connection refused');
+
+      const source = await service.getSource('articles');
+      expect(source.profileName).toBe('default');
+      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalled();
+      expect(events.events.some((e) => e.name === 'rag.source.profile.changed')).toBe(false);
     });
   });
 
