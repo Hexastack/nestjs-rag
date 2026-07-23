@@ -220,6 +220,15 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       const previous = revisions.find((r) => r.id === profile.activeRevisionId);
       expect(previous?.status).toBe(RagRevisionStatus.ARCHIVED);
     });
+
+    it('mirrors a description change onto the profile row served by getProfile()', async () => {
+      await service.createProfile({
+        name: 'default',
+        configuration: { ...lexicalConfig(), description: 'original description' },
+      });
+      await service.updateProfile('default', { description: 'updated description' }, { applyStrategy: 'apply-immediately' });
+      expect((await service.getProfile('default')).description).toBe('updated description');
+    });
   });
 
   describe('updateProfile: stage', () => {
@@ -422,6 +431,18 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       const rolledBack = await service.rollback('default', initial.activeRevisionId!);
       expect(rolledBack.id).toBe(initial.activeRevisionId);
       expect((await service.getActiveRevision('default')).id).toBe(initial.activeRevisionId);
+    });
+
+    it('restores the rolled-back revision\'s description on the profile row', async () => {
+      const initial = await service.createProfile({
+        name: 'default',
+        configuration: { ...lexicalConfig(), description: 'original description' },
+      });
+      await service.updateProfile('default', { description: 'updated description' }, { applyStrategy: 'apply-immediately' });
+      expect((await service.getProfile('default')).description).toBe('updated description');
+
+      await service.rollback('default', initial.activeRevisionId!);
+      expect((await service.getProfile('default')).description).toBe('original description');
     });
 
     it('emits a profile.rolled_back event', async () => {

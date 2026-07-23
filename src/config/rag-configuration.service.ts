@@ -346,10 +346,17 @@ export class RagConfigurationService {
       // loaded above — the status/consistency checks ran against that
       // snapshot, and a concurrent writer may have activated another
       // revision since. `affected` 0 rolls the whole activation back.
+      // The profile row mirrors the *active* revision's description (it is
+      // what getProfile()/listProfiles() serve), so every pointer flip —
+      // activation and rollback alike — must carry it along.
       const flip = await manager.update(
         this.profileRepo.target,
         { id: profileRow.id, activeRevisionId: expectedActiveId ?? IsNull() },
-        { activeRevisionId: revisionId, updatedAt: now },
+        {
+          activeRevisionId: revisionId,
+          description: (revisionRow.configuration as RagProfileConfiguration).description ?? null,
+          updatedAt: now,
+        },
       );
       if (!flip.affected) {
         const fresh = await manager.findOne(this.profileRepo.target, { where: { id: profileRow.id } });
@@ -579,10 +586,13 @@ export class RagConfigurationService {
       // that activated another revision in the meantime makes `affected` 0,
       // rolling everything back instead of applying a patch computed from a
       // stale configuration.
+      // Mirror the newly active configuration's description onto the profile
+      // row — description-only changes are NONE-impact and land exactly here,
+      // and getProfile() serves the row's copy.
       const flip = await manager.update(
         this.profileRepo.target,
         { id: profileRow.id, activeRevisionId: activeRow.id },
-        { activeRevisionId: newRevisionId, updatedAt: now },
+        { activeRevisionId: newRevisionId, description: proposed.description ?? null, updatedAt: now },
       );
       if (!flip.affected) {
         const fresh = await manager.findOne(this.profileRepo.target, { where: { id: profileRow.id } });
