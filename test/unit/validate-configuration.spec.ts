@@ -79,6 +79,18 @@ describe('validateProfileConfigurationStructure', () => {
     expect(result.errors.some((e) => e.includes('createVectorExtension'))).toBe(true);
   });
 
+  it('rejects embedding config without the vector column even when the default mode is lexical', () => {
+    const config: RagProfileConfiguration = {
+      ...validConfig(),
+      retrieval: {
+        defaultMode: RagRetrievalMode.LEXICAL,
+        embedding: { providerId: 'openai', modelId: 'text-embedding-3-small', dimensions: 1536 },
+      },
+    };
+    const result = validateProfileConfigurationStructure(config, { dbType: RagDatabaseType.POSTGRES, vectorColumnEnabled: false });
+    expect(result.errors.some((e) => e.includes('createVectorExtension'))).toBe(true);
+  });
+
   it('accepts embedding config on Postgres when the vector column is enabled', () => {
     const config: RagProfileConfiguration = {
       ...validConfig(),

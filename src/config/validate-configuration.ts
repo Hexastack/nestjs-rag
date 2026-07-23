@@ -79,10 +79,16 @@ export function validateProfileConfigurationStructure(
       if (retrieval.embedding) {
         errors.push('retrieval.embedding must not be set for a SQLite-backed profile.');
       }
-    } else if (needsEmbedding) {
-      if (!retrieval.embedding) {
+    } else {
+      if (needsEmbedding && !retrieval.embedding) {
         errors.push(`retrieval.embedding is required when retrieval.defaultMode is "${retrieval.defaultMode}".`);
-      } else if (!context.vectorColumnEnabled) {
+      }
+      // Checked whenever an embedding configuration is present — not only
+      // when the *default* mode needs it — because a per-search
+      // `mode: embedding`/`hybrid` override on a lexical-default profile
+      // reaches the same pgvector SQL and would otherwise fail at the
+      // database layer instead of at validation time.
+      if (retrieval.embedding && !context.vectorColumnEnabled) {
         errors.push(
           'retrieval.embedding is set but this RagModule was not configured with ' +
             '`schema.createVectorExtension: true`, so no native vector column is available. ' +
