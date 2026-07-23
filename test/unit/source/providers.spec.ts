@@ -102,6 +102,75 @@ describe('EntitySourceProvider', () => {
   });
 });
 
+describe('EntitySourceProvider with a TypeORM soft-delete column', () => {
+  interface SoftDeleteArticleRow {
+    id: number;
+    title: string;
+    deletedAt: Date | null;
+  }
+
+  const SoftDeleteArticleSchema = new EntitySchema<SoftDeleteArticleRow>({
+    name: 'SoftDeleteArticle',
+    tableName: 'soft_delete_articles',
+    columns: {
+      id: { type: 'int', primary: true, generated: true },
+      title: { type: 'varchar' },
+      deletedAt: { type: 'datetime', deleteDate: true, nullable: true },
+    },
+  });
+
+  let dataSource: DataSource;
+
+  beforeEach(async () => {
+    dataSource = new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [SoftDeleteArticleSchema],
+      synchronize: true,
+    });
+    await dataSource.initialize();
+    const repo = dataSource.getRepository(SoftDeleteArticleSchema);
+    await repo.save([{ title: 'kept' }, { title: 'removed' }]);
+    await repo.softDelete(2);
+  });
+
+  afterEach(() => dataSource.destroy());
+
+  it('surfaces soft-deleted rows as tombstones when the mapping declares deletedAt', async () => {
+    const provider = new EntitySourceProvider('soft-articles', dataSource, SoftDeleteArticleSchema, {
+      id: 'id',
+      content: [{ column: 'title' }],
+      deletedAt: 'deletedAt',
+    });
+    const page = await provider.fetchRecords({ cursor: null, batchSize: 10 });
+    expect(page.records).toHaveLength(2);
+    const deleted = page.records.find((r) => r.externalId === '2');
+    expect(deleted?.deletedAt).toBeInstanceOf(Date);
+    expect(page.records.find((r) => r.externalId === '1')?.deletedAt).toBeNull();
+  });
+
+  it('fetchRecord also observes the tombstone of a soft-deleted row', async () => {
+    const provider = new EntitySourceProvider('soft-articles', dataSource, SoftDeleteArticleSchema, {
+      id: 'id',
+      content: [{ column: 'title' }],
+      deletedAt: 'deletedAt',
+    });
+    const record = await provider.fetchRecord('2');
+    expect(record).not.toBeNull();
+    expect(record?.deletedAt).toBeInstanceOf(Date);
+  });
+
+  it('keeps excluding soft-deleted rows when the mapping declares no deletedAt column', async () => {
+    const provider = new EntitySourceProvider('soft-articles', dataSource, SoftDeleteArticleSchema, {
+      id: 'id',
+      content: [{ column: 'title' }],
+    });
+    const page = await provider.fetchRecords({ cursor: null, batchSize: 10 });
+    expect(page.records.map((r) => r.externalId)).toEqual(['1']);
+    expect(await provider.fetchRecord('2')).toBeNull();
+  });
+});
+
 describe('TableSourceProvider', () => {
   let dataSource: DataSource;
 

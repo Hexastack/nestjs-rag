@@ -41,6 +41,17 @@ export class EntitySourceProvider<TEntity extends ObjectLiteral = ObjectLiteral>
 
     const qb = repo.createQueryBuilder('e').orderBy(`e.${idProp}`, 'ASC').limit(batchSize);
 
+    // When the mapped `deletedAt` is the entity's TypeORM @DeleteDateColumn,
+    // the query builder's implicit soft-delete filter would exclude deleted
+    // rows before the mapper could observe their tombstones — and their
+    // indexed documents could then never be removed by a sync. Reads must
+    // include deleted rows so the indexer sees `deletedAt` and deletes the
+    // document. Only done when a tombstone column is actually mapped:
+    // without one, a deleted row would otherwise be indexed as live content.
+    if (this.mapping.deletedAt) {
+      qb.withDeleted();
+    }
+
     if (options.cursor) {
       qb.andWhere(`e.${idProp} > :cursor`, { cursor: options.cursor });
     }
@@ -70,10 +81,13 @@ export class EntitySourceProvider<TEntity extends ObjectLiteral = ObjectLiteral>
   async fetchRecord(externalId: string): Promise<RagSourceRecord | null> {
     const repo = this.dataSource.getRepository(this.entity);
     const idProp = this.mapping.id as string;
-    const row = await repo
-      .createQueryBuilder('e')
-      .where(`e.${idProp} = :id`, { id: externalId })
-      .getOne();
+    const qb = repo.createQueryBuilder('e').where(`e.${idProp} = :id`, { id: externalId });
+    // See fetchRecords: a mapped tombstone column must be observable even
+    // when it is the entity's TypeORM soft-delete column.
+    if (this.mapping.deletedAt) {
+      qb.withDeleted();
+    }
+    const row = await qb.getOne();
     if (!row) return null;
     const transformed = this.transform ? await this.transform(row) : row;
     return mapRecordToSourceRecord(transformed as unknown as Record<string, unknown>, this.mapping, this.name);
