@@ -1,5 +1,5 @@
 import { Inject, Injectable, forwardRef } from '@nestjs/common';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, EntityManager, Repository } from 'typeorm';
 import {
   DEFAULT_SOURCE_BATCH_SIZE,
   DIRECT_SOURCE_NAME,
@@ -7,14 +7,15 @@ import {
   RAG_CHUNK_REPOSITORY,
   RAG_DATA_SOURCE,
   RAG_DOCUMENT_REPOSITORY,
+  RAG_PROFILE_REVISION_REPOSITORY,
   RAG_RESOLVED_OPTIONS,
   RAG_SCHEMA_SERVICE,
   RAG_SOURCE_BINDING_REPOSITORY,
 } from '../constants';
-import { RagOperationStatus } from '../enums';
-import { RagChunkEmbeddingRow, RagChunkRow, RagDocumentRow, RagSourceBindingRow } from '../entities/rows';
+import { RagOperationStatus, RagRevisionStatus } from '../enums';
+import { RagChunkEmbeddingRow, RagChunkRow, RagDocumentRow, RagProfileRevisionRow, RagSourceBindingRow } from '../entities/rows';
 import { RagSchemaService } from '../entities/rag-schema.service';
-import { RagConfigurationError, RagSourceNotFoundError } from '../errors';
+import { RagConcurrencyError, RagConfigurationError, RagProfileRevisionError, RagSourceNotFoundError } from '../errors';
 import { RagProfileConfiguration } from '../interfaces/profile.interface';
 import { RagDocumentInput, RagIngestOptions, RagIngestResult } from '../interfaces/ingest.interface';
 import {
@@ -47,6 +48,18 @@ interface RevisionContext {
    */
   dataRevisionId: string;
   configuration: RagProfileConfiguration;
+  /**
+   * How this context was obtained, which decides the write-time guard in
+   * `assertRevisionWritable`:
+   * - `active` — resolved from the profile's *currently active* revision; the
+   *   write must abort if activation has since moved the profile to a
+   *   different data revision (otherwise it would land in an archived row set
+   *   and be invisible, unrecoverable, and eligible for purge).
+   * - `pinned` — the caller named the revision explicitly (ingest/sync
+   *   overrides, staged re-index); any status is fine except `archived` and
+   *   `failed`, which are never legitimate write targets.
+   */
+  resolution: 'active' | 'pinned';
 }
 
 /**
@@ -65,6 +78,7 @@ export class RagIndexingService {
     @Inject(RAG_CHUNK_REPOSITORY) private readonly chunkRepo: Repository<RagChunkRow>,
     @Inject(RAG_CHUNK_EMBEDDING_REPOSITORY) private readonly chunkEmbeddingRepo: Repository<RagChunkEmbeddingRow>,
     @Inject(RAG_SOURCE_BINDING_REPOSITORY) private readonly sourceBindingRepo: Repository<RagSourceBindingRow>,
+    @Inject(RAG_PROFILE_REVISION_REPOSITORY) private readonly revisionRepo: Repository<RagProfileRevisionRow>,
     @Inject(RAG_DATA_SOURCE) private readonly dataSource: DataSource,
     @Inject(RAG_SCHEMA_SERVICE) private readonly schemaService: RagSchemaService,
     @Inject(RAG_RESOLVED_OPTIONS) private readonly context: RagResolvedModuleContext,
@@ -145,7 +159,7 @@ export class RagIndexingService {
     }
     const revision = await this.resolveRevisionContext(binding.profileName);
     if (record.deletedAt) {
-      await this.deleteDocument(revision.dataRevisionId, sourceName, record.externalId);
+      await this.deleteDocument(revision, sourceName, record.externalId);
       return {
         documentId: '',
         sourceName,
@@ -173,7 +187,7 @@ export class RagIndexingService {
   async removeSourceRecord(sourceName: string, sourceId: string | number): Promise<void> {
     const binding = await this.getBindingOrThrow(sourceName);
     const revision = await this.resolveRevisionContext(binding.profileName);
-    await this.deleteDocument(revision.dataRevisionId, sourceName, String(sourceId));
+    await this.deleteDocument(revision, sourceName, String(sourceId));
   }
 
   /**
@@ -195,7 +209,7 @@ export class RagIndexingService {
       where: { profileRevisionId: revision.dataRevisionId, sourceName },
     });
     for (const document of documents) {
-      await this.deleteDocument(revision.dataRevisionId, sourceName, document.externalId);
+      await this.deleteDocument(revision, sourceName, document.externalId);
     }
     return { documentsRemoved: documents.length };
   }
@@ -226,7 +240,13 @@ export class RagIndexingService {
       await this.embeddingRegistry.validateConfiguration(configuration.retrieval.embedding);
     }
 
-    const context: RevisionContext = { profileName, revisionId, dataRevisionId: revision.dataRevisionId, configuration };
+    const context: RevisionContext = {
+      profileName,
+      revisionId,
+      dataRevisionId: revision.dataRevisionId,
+      configuration,
+      resolution: 'pinned',
+    };
 
     const allBindings = await this.sourceBindingRepo.find({ where: { profileName } });
     const targetBindings = options.sources
@@ -327,7 +347,7 @@ export class RagIndexingService {
       for (const record of page.records) {
         try {
           if (record.deletedAt) {
-            await this.deleteDocument(revision.dataRevisionId, sourceName, record.externalId);
+            await this.deleteDocument(revision, sourceName, record.externalId);
             documentsRemoved += 1;
             continue;
           }
@@ -517,6 +537,7 @@ export class RagIndexingService {
 
       if (metadataChanged || namespaceChanged || updatedAtChanged) {
         await this.dataSource.transaction(async (manager) => {
+          await this.assertRevisionWritable(manager, revision);
           await manager.update(this.documentRepo.target, { id: existing.id }, {
             namespace: record.namespace ?? null,
             metadata: (record.metadata ?? null) as Record<string, unknown>,
@@ -565,6 +586,12 @@ export class RagIndexingService {
     const now = new Date();
 
     await this.dataSource.transaction(async (manager) => {
+      // The revision was resolved before chunking and embedding, which can
+      // take seconds (network round-trip to the embedding provider). An
+      // activation may have landed in between, so re-assert the target inside
+      // the write transaction — otherwise this write would silently go into
+      // an archived row set.
+      await this.assertRevisionWritable(manager, revision);
       if (existing) {
         // Delete existing chunks/embeddings for this document, then rewrite.
         const oldChunks = await manager.find<RagChunkRow>(this.chunkRepo.target, { where: { documentId } });
@@ -654,17 +681,20 @@ export class RagIndexingService {
 
   /**
    * Deletes a document (and its chunks/embeddings/FTS rows) from *one*
-   * physical row set only — the one owned by `profileRevisionId` (always a
-   * *data* revision id). Row sets built by other re-indexes keep their copy
+   * physical row set only — the one owned by `revision.dataRevisionId`. Row
+   * sets built by other re-indexes keep their copy
    * until `cleanupArchivedRevisions` purges them, so rollback across a
    * re-index boundary restores exactly what that revision indexed. Query-only
    * revisions that share this data revision see the delete immediately: a
    * query-only lineage is one live corpus, not a chain of snapshots.
    */
-  private async deleteDocument(profileRevisionId: string, sourceName: string, externalId: string): Promise<void> {
-    const documents = await this.documentRepo.find({ where: { profileRevisionId, sourceName, externalId } });
+  private async deleteDocument(revision: RevisionContext, sourceName: string, externalId: string): Promise<void> {
+    const documents = await this.documentRepo.find({
+      where: { profileRevisionId: revision.dataRevisionId, sourceName, externalId },
+    });
     for (const document of documents) {
       await this.dataSource.transaction(async (manager) => {
+        await this.assertRevisionWritable(manager, revision);
         const chunks = await manager.find<RagChunkRow>(this.chunkRepo.target, { where: { documentId: document.id } });
         if (chunks.length > 0) {
           await manager.delete(
@@ -730,15 +760,74 @@ export class RagIndexingService {
     }
   }
 
+  /**
+   * Re-asserts, *inside the write transaction*, that `revision` is still a
+   * legitimate write target. The context was resolved before the expensive
+   * work (chunking, embedding provider round-trips), so a concurrent
+   * `activateRevision` may have archived it since.
+   *
+   * - `active` contexts: the profile's active revision must still serve the
+   *   same `dataRevisionId`. Comparing data lineage rather than status keeps
+   *   query-only activations harmless (they archive the old revision *row*
+   *   but keep serving its physical rows) while catching reindex activations,
+   *   where the write would otherwise land in a dead row set. On Postgres the
+   *   row is read `FOR SHARE`, so a concurrent activation's archive UPDATE
+   *   serializes against in-flight writes instead of racing them; SQLite's
+   *   single-writer transactions make the plain read sufficient (and it
+   *   supports no lock clause).
+   * - `pinned` contexts: the named revision must not have moved to
+   *   `archived`/`failed` since resolution validated it.
+   */
+  private async assertRevisionWritable(manager: EntityManager, revision: RevisionContext): Promise<void> {
+    const lock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_read' } as const) : undefined;
+    if (revision.resolution === 'active') {
+      const activeRow = await manager.findOne<RagProfileRevisionRow>(this.revisionRepo.target, {
+        where: { profileName: revision.profileName, status: RagRevisionStatus.ACTIVE },
+        ...(lock ? { lock } : {}),
+      });
+      if (!activeRow || activeRow.dataRevisionId !== revision.dataRevisionId) {
+        throw new RagConcurrencyError(revision.profileName, revision.revisionId, activeRow?.id ?? 'none');
+      }
+      return;
+    }
+    const row = await manager.findOne<RagProfileRevisionRow>(this.revisionRepo.target, {
+      where: { id: revision.revisionId },
+      ...(lock ? { lock } : {}),
+    });
+    if (!row || row.status === RagRevisionStatus.ARCHIVED || row.status === RagRevisionStatus.FAILED) {
+      throw new RagProfileRevisionError(
+        `Revision "${revision.revisionId}" of profile "${revision.profileName}" changed status concurrently ` +
+          `(now: "${row?.status ?? 'deleted'}") and is no longer a valid write target.`,
+        { profileName: revision.profileName, revisionId: revision.revisionId, status: row?.status ?? null },
+      );
+    }
+  }
+
   private async resolveRevisionContext(profileName: string, revisionId?: string): Promise<RevisionContext> {
-    const revision = revisionId
-      ? await this.configurationService.getRevision(profileName, revisionId)
-      : await this.configurationService.getActiveRevision(profileName);
+    if (revisionId) {
+      const revision = await this.configurationService.getRevision(profileName, revisionId);
+      if (revision.status === RagRevisionStatus.ARCHIVED || revision.status === RagRevisionStatus.FAILED) {
+        throw new RagProfileRevisionError(
+          `Revision "${revisionId}" of profile "${profileName}" cannot be written to (status: "${revision.status}"). ` +
+            `Archived revisions are immutable rollback snapshots and failed revisions must be re-indexed via the staged workflow.`,
+          { profileName, revisionId, status: revision.status },
+        );
+      }
+      return {
+        profileName,
+        revisionId: revision.id,
+        dataRevisionId: revision.dataRevisionId,
+        configuration: revision.configuration,
+        resolution: 'pinned',
+      };
+    }
+    const revision = await this.configurationService.getActiveRevision(profileName);
     return {
       profileName,
       revisionId: revision.id,
       dataRevisionId: revision.dataRevisionId,
       configuration: revision.configuration,
+      resolution: 'active',
     };
   }
 

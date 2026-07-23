@@ -2,8 +2,8 @@ import { RagIndexingService } from '../../../src/indexing/rag-indexing.service';
 import { RagSourceRegistry } from '../../../src/source/source-registry';
 import { ChonkieChunkerFactory } from '../../../src/chunking/chonkie-chunker.factory';
 import { RagEmbeddingProviderRegistry } from '../../../src/providers/embedding-provider-registry';
-import { RagChunkingStrategy, RagOperationStatus, RagRetrievalMode } from '../../../src/enums';
-import { RagSourceNotFoundError } from '../../../src/errors';
+import { RagChunkingStrategy, RagOperationStatus, RagRetrievalMode, RagRevisionStatus } from '../../../src/enums';
+import { RagConcurrencyError, RagProfileRevisionError, RagSourceNotFoundError } from '../../../src/errors';
 import { RagSourceProvider, RagSourceRecord } from '../../../src/interfaces/source.interface';
 import { createSqliteTestContext, SqliteTestContext } from '../test-utils/sqlite-test-context';
 
@@ -12,12 +12,38 @@ function lexicalRevision(id: string, overrides: Partial<any> = {}) {
     id,
     dataRevisionId: id,
     profileName: 'default',
+    status: RagRevisionStatus.ACTIVE,
     configuration: {
       name: 'default',
       retrieval: { defaultMode: RagRetrievalMode.LEXICAL, lexical: { language: 'english' } },
       chunking: { strategy: RagChunkingStrategy.TOKEN, chunkSize: 50, chunkOverlap: 0 },
       ...overrides,
     },
+  };
+}
+
+/**
+ * Physical revision row matching what `lexicalRevision` mocks at the service
+ * layer — the write-time guard (`assertRevisionWritable`) re-reads revision
+ * rows inside the write transaction, so they have to actually exist.
+ */
+function revisionRow(id: string, revisionNumber: number, status: string, overrides: Partial<any> = {}) {
+  return {
+    id,
+    profileId: 'profile-1',
+    profileName: 'default',
+    revisionNumber,
+    status,
+    configuration: lexicalRevision(id).configuration,
+    configurationHash: `hash-${id}`,
+    changeImpact: 'none',
+    previousRevisionId: null,
+    dataRevisionId: id,
+    error: null,
+    createdAt: new Date(),
+    activatedAt: null,
+    failedAt: null,
+    ...overrides,
   };
 }
 
@@ -57,11 +83,17 @@ describe('RagIndexingService', () => {
     sourceRegistry = new RagSourceRegistry();
     embeddingService = { embedMany: jest.fn().mockResolvedValue([]), embedQuery: jest.fn() };
 
+    await ctx.repos.profileRevision.save([
+      revisionRow('rev-1', 1, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }),
+      revisionRow('rev-2', 2, RagRevisionStatus.PENDING),
+    ] as any);
+
     service = new RagIndexingService(
       ctx.repos.document as any,
       ctx.repos.chunk as any,
       ctx.repos.chunkEmbedding as any,
       ctx.repos.sourceBinding as any,
+      ctx.repos.profileRevision as any,
       ctx.dataSource,
       ctx.schemaService,
       ctx.context,
@@ -390,6 +422,74 @@ describe('RagIndexingService', () => {
       expect(result.documentsIndexed).toBe(1);
       const rev2Docs = await ctx.repos.document.count({ where: { profileRevisionId: 'rev-2' } });
       expect(rev2Docs).toBe(1);
+    });
+  });
+
+  describe('revision write guards', () => {
+    it('rejects an ingest whose resolved active revision was replaced by a reindex activation mid-flight', async () => {
+      // The mocked configuration service keeps handing out rev-1 (the stale
+      // pre-activation resolution); the database now says rev-3, with a
+      // different data lineage, is active.
+      await ctx.repos.profileRevision.update({ id: 'rev-1' }, { status: RagRevisionStatus.ARCHIVED });
+      await ctx.repos.profileRevision.save(
+        revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }) as any,
+      );
+
+      await expect(service.ingest({ externalId: 'doc-1', content: 'lands nowhere' })).rejects.toThrow(RagConcurrencyError);
+      expect(await ctx.repos.document.count()).toBe(0);
+    });
+
+    it('allows an ingest across a query-only activation (same data lineage, different active revision row)', async () => {
+      await ctx.repos.profileRevision.update({ id: 'rev-1' }, { status: RagRevisionStatus.ARCHIVED });
+      await ctx.repos.profileRevision.save(
+        revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { dataRevisionId: 'rev-1', activatedAt: new Date() }) as any,
+      );
+
+      const result = await service.ingest({ externalId: 'doc-1', content: 'still lands in the live corpus' });
+      expect(result.skipped).toBe(false);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: 'rev-1' } })).toBe(1);
+    });
+
+    it('rejects an explicit revisionId that targets an archived or failed revision', async () => {
+      configurationService.getRevision.mockImplementation(async (_p: string, id: string) => ({
+        ...lexicalRevision(id),
+        status: id === 'rev-archived' ? RagRevisionStatus.ARCHIVED : RagRevisionStatus.FAILED,
+      }));
+
+      await expect(service.ingest({ externalId: 'doc-1', content: 'x' }, { revisionId: 'rev-archived' })).rejects.toThrow(
+        RagProfileRevisionError,
+      );
+      await expect(service.ingest({ externalId: 'doc-1', content: 'x' }, { revisionId: 'rev-failed' })).rejects.toThrow(
+        RagProfileRevisionError,
+      );
+      expect(await ctx.repos.document.count()).toBe(0);
+    });
+
+    it('rejects a delete against a revision that was archived mid-flight', async () => {
+      await ctx.repos.sourceBinding.save({
+        id: 'binding-1',
+        sourceName: 'kb',
+        profileName: 'default',
+        sourceConfiguration: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      sourceRegistry.register({
+        name: 'kb',
+        kind: 'provider',
+        provider: new InMemorySourceProvider('kb', [{ externalId: '1', content: 'indexed before the race' }]),
+        defaultProfileName: 'default',
+      } as any);
+      await service.indexSourceRecord('kb', '1');
+
+      await ctx.repos.profileRevision.update({ id: 'rev-1' }, { status: RagRevisionStatus.ARCHIVED });
+      await ctx.repos.profileRevision.save(
+        revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }) as any,
+      );
+
+      await expect(service.removeSourceRecord('kb', '1')).rejects.toThrow(RagConcurrencyError);
+      // The archived snapshot keeps its document.
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: 'rev-1' } })).toBe(1);
     });
   });
 });
