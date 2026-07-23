@@ -144,6 +144,40 @@ describe('RAG integration (SQLite, lexical-only)', () => {
     await app.close();
   });
 
+  it('supports the documented manual staged workflow: stage → reindexRevision → activateRevision', async () => {
+    const app = await buildApp();
+    const ragService = app.get(RagService);
+    const configurationService = app.get(RagConfigurationService);
+
+    await ragService.ingest({ externalId: 'doc-staged', content: 'Manual staging notes about lighthouses and harbors.' });
+
+    // The exact sequence from the README's "Staging, activating, rolling
+    // back" example: the re-index must move the revision to `ready`, or
+    // activateRevision refuses it.
+    // Chunk values deliberately differ from every other test in this suite:
+    // the profile (shared SQLite file) keeps this configuration afterwards,
+    // and a later updateProfile with identical values would classify as a
+    // no-op and skip re-indexing.
+    const staged = await configurationService.updateProfile(
+      'default',
+      { chunking: { chunkSize: 80, chunkOverlap: 8 } },
+      { applyStrategy: 'stage' },
+    );
+    expect(staged.revision.status).toBe(RagRevisionStatus.PENDING);
+
+    const reindexResult = await ragService.reindexRevision('default', staged.revision.id);
+    expect(reindexResult.readyForActivation).toBe(true);
+    expect((await configurationService.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
+
+    const activated = await configurationService.activateRevision('default', staged.revision.id);
+    expect(activated.status).toBe(RagRevisionStatus.ACTIVE);
+    expect((await configurationService.getActiveRevision('default')).id).toBe(staged.revision.id);
+
+    const results = await ragService.search('lighthouses');
+    expect(results.length).toBeGreaterThan(0);
+    await app.close();
+  });
+
   it('re-indexes a pending revision and activates it; search then reflects the new revision', async () => {
     // Registered sources are re-synced from their provider during
     // `reindex-and-activate`; directly ingested documents are carried

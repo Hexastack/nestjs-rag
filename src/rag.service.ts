@@ -7,6 +7,7 @@ import {
   RagSourceSyncResult,
 } from './interfaces/reindex.interface';
 import { RagSearchOptions, RagSearchResult } from './interfaces/search.interface';
+import { RagConfigurationService } from './config/rag-configuration.service';
 import { RagIndexingService } from './indexing/rag-indexing.service';
 import { RagSearchService } from './search/rag-search.service';
 
@@ -22,6 +23,7 @@ export class RagService {
   constructor(
     private readonly indexingService: RagIndexingService,
     private readonly searchService: RagSearchService,
+    private readonly configurationService: RagConfigurationService,
   ) {}
 
   ingest(document: RagDocumentInput, options?: RagIngestOptions): Promise<RagIngestResult> {
@@ -48,8 +50,15 @@ export class RagService {
     return this.indexingService.removeSourceRecord(sourceName, sourceId);
   }
 
+  /**
+   * Both re-index entry points route through `RagConfigurationService` so a
+   * staged revision's status lifecycle (`pending → indexing → ready`/`failed`)
+   * is driven alongside the physical re-index — the raw
+   * `RagIndexingService.reindexRevision` never touches revision status, and
+   * `activateRevision` only accepts a `ready` revision.
+   */
   reindexProfile(profileName: string, options?: RagProfileReindexOptions): Promise<RagProfileReindexResult> {
-    return this.indexingService.reindexProfile(profileName, options);
+    return this.configurationService.reindexStagedProfile(profileName, options);
   }
 
   reindexRevision(
@@ -57,7 +66,7 @@ export class RagService {
     revisionId: string,
     options?: RagProfileReindexOptions,
   ): Promise<RagProfileReindexResult> {
-    return this.indexingService.reindexRevision(profileName, revisionId, options);
+    return this.configurationService.reindexStagedRevision(profileName, revisionId, options);
   }
 
   search(query: string, options?: RagSearchOptions): Promise<RagSearchResult[]> {

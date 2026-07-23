@@ -14,7 +14,7 @@ import {
 import { RagOperationStatus } from '../enums';
 import { RagChunkEmbeddingRow, RagChunkRow, RagDocumentRow, RagSourceBindingRow } from '../entities/rows';
 import { RagSchemaService } from '../entities/rag-schema.service';
-import { RagConfigurationError, RagSourceNotFoundError, RagValidationError } from '../errors';
+import { RagConfigurationError, RagSourceNotFoundError } from '../errors';
 import { RagProfileConfiguration } from '../interfaces/profile.interface';
 import { RagDocumentInput, RagIngestOptions, RagIngestResult } from '../interfaces/ingest.interface';
 import {
@@ -203,21 +203,16 @@ export class RagIndexingService {
   // Profile / revision re-indexing
   // ---------------------------------------------------------------------
 
-  async reindexProfile(
-    profileName: string,
-    options: RagProfileReindexOptions = {},
-  ): Promise<RagProfileReindexResult> {
-    const revisions = await this.configurationService.listRevisions(profileName);
-    const target = revisions.find((r) => r.status === 'pending' || r.status === 'indexing');
-    if (!target) {
-      throw new RagValidationError([
-        `Profile "${profileName}" has no pending revision to re-index. Call updateProfile(..., { applyStrategy: 'stage' }) ` +
-          `first, or use "reindex-and-activate" which stages and re-indexes in one call.`,
-      ]);
-    }
-    return this.reindexRevision(profileName, target.id, options);
-  }
-
+  /**
+   * The raw physical re-index: syncs every bound source (and carries forward
+   * unbound/direct documents) into the revision's row set. It deliberately
+   * performs no revision status transitions — that lifecycle
+   * (`pending → indexing → ready`/`failed`) is owned by
+   * `RagConfigurationService.reindexStagedRevision`, which wraps this method
+   * and is what `RagService.reindexProfile`/`reindexRevision` call. Invoking
+   * this directly leaves a staged revision `pending`, and `activateRevision`
+   * will refuse it.
+   */
   async reindexRevision(
     profileName: string,
     revisionId: string,

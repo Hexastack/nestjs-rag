@@ -299,6 +299,101 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
     });
   });
 
+  describe('reindexStagedRevision (manual staged workflow)', () => {
+    const readyResult = (revisionId: string): RagProfileReindexResult => ({
+      profileName: 'default',
+      revisionId,
+      status: RagOperationStatus.COMPLETED,
+      sources: [],
+      documentsIndexed: 2,
+      chunksCreated: 4,
+      embeddingsCreated: 0,
+      failures: 0,
+      readyForActivation: true,
+    });
+
+    it('supports the documented stage → reindex → activate sequence', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      indexingService.reindexRevision.mockImplementation(
+        async (_profileName: string, revisionId: string) => readyResult(revisionId),
+      );
+
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      const result = await service.reindexStagedRevision('default', staged.revision.id);
+      expect(result.readyForActivation).toBe(true);
+      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
+      expect(events.events.map((e) => e.name)).toEqual(
+        expect.arrayContaining(['rag.profile.revision.indexing', 'rag.profile.revision.ready']),
+      );
+
+      const activated = await service.activateRevision('default', staged.revision.id);
+      expect(activated.status).toBe(RagRevisionStatus.ACTIVE);
+      expect((await service.getActiveRevision('default')).id).toBe(staged.revision.id);
+    });
+
+    it('marks the revision failed when the re-index does not produce a ready index', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      indexingService.reindexRevision.mockResolvedValue({
+        ...readyResult('x'),
+        status: RagOperationStatus.FAILED,
+        failures: 3,
+        readyForActivation: false,
+      } satisfies RagProfileReindexResult);
+
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      await service.reindexStagedRevision('default', staged.revision.id);
+      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.FAILED);
+    });
+
+    it('marks the revision failed and rethrows when the indexing service throws', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      indexingService.reindexRevision.mockRejectedValue(new Error('embedding provider unreachable'));
+
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      await expect(service.reindexStagedRevision('default', staged.revision.id)).rejects.toThrow('unreachable');
+      const revision = await service.getRevision('default', staged.revision.id);
+      expect(revision.status).toBe(RagRevisionStatus.FAILED);
+      expect(revision.error?.message).toContain('unreachable');
+    });
+
+    it('allows retrying a previously failed staged revision', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+
+      indexingService.reindexRevision.mockRejectedValueOnce(new Error('transient outage'));
+      await expect(service.reindexStagedRevision('default', staged.revision.id)).rejects.toThrow('transient outage');
+
+      indexingService.reindexRevision.mockImplementation(
+        async (_profileName: string, revisionId: string) => readyResult(revisionId),
+      );
+      await service.reindexStagedRevision('default', staged.revision.id);
+      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
+    });
+
+    it('re-indexes the active revision in place without corrupting its status', async () => {
+      const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      indexingService.reindexRevision.mockImplementation(
+        async (_profileName: string, revisionId: string) => readyResult(revisionId),
+      );
+
+      await service.reindexStagedRevision('default', profile.activeRevisionId!);
+      expect((await service.getActiveRevision('default')).status).toBe(RagRevisionStatus.ACTIVE);
+    });
+
+    it('reindexStagedProfile finds the pending revision, and throws when there is none', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      await expect(service.reindexStagedProfile('default')).rejects.toThrow(RagValidationError);
+
+      indexingService.reindexRevision.mockImplementation(
+        async (_profileName: string, revisionId: string) => readyResult(revisionId),
+      );
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      const result = await service.reindexStagedProfile('default');
+      expect(result.revisionId).toBe(staged.revision.id);
+      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
+    });
+  });
+
   describe('activateRevision', () => {
     it('is atomic: rejects activating a revision that is not ready/archived', async () => {
       await service.createProfile({ name: 'default', configuration: lexicalConfig() });

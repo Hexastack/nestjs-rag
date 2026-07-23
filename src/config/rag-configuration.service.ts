@@ -577,22 +577,99 @@ export class RagConfigurationService {
     return revision;
   }
 
+  /**
+   * Re-indexes a staged revision and drives its status lifecycle:
+   * `pending → indexing → ready` on success, `→ failed` otherwise — without
+   * activating it. This is what makes the manual staged workflow
+   * (`stage` → re-index → `activateRevision`) possible: `activateRevision`
+   * only accepts a `ready` (or `archived`) revision, and the raw
+   * `RagIndexingService.reindexRevision` never touches revision status.
+   * `RagService.reindexRevision` delegates here.
+   *
+   * Only revisions in a staged lifecycle state (`pending`, `indexing`,
+   * `failed`) are transitioned. Any other revision (e.g. the active one,
+   * re-indexed in place) is re-indexed as-is, so its status is never
+   * corrupted.
+   *
+   * Throws whatever the re-index throws (after marking the revision
+   * `failed`); a re-index that completes but does not produce a ready index
+   * resolves with the result and marks the revision `failed`.
+   */
+  async reindexStagedRevision(
+    profileName: string,
+    revisionId: string,
+    options?: RagProfileReindexOptions,
+  ): Promise<RagProfileReindexResult> {
+    const revisionRow = await this.findRevisionRowOrThrow(profileName, revisionId);
+    const staged =
+      revisionRow.status === RagRevisionStatus.PENDING ||
+      revisionRow.status === RagRevisionStatus.INDEXING ||
+      revisionRow.status === RagRevisionStatus.FAILED;
+
+    if (staged) {
+      await this.setRevisionStatus(revisionId, RagRevisionStatus.INDEXING);
+      this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_INDEXING, {
+        profileName,
+        revision: await this.getRevision(profileName, revisionId),
+      } satisfies RagProfileRevisionEvent);
+    }
+
+    let result: RagProfileReindexResult;
+    try {
+      result = await this.indexingService.reindexRevision(profileName, revisionId, options);
+    } catch (error) {
+      if (staged) {
+        await this.markRevisionFailed(revisionId, error);
+      }
+      throw error;
+    }
+
+    if (!staged) {
+      return result;
+    }
+
+    if (result.status === RagOperationStatus.FAILED || !result.readyForActivation) {
+      await this.markRevisionFailed(revisionId, new Error('Re-index did not produce a ready index.'));
+      return result;
+    }
+
+    await this.setRevisionStatus(revisionId, RagRevisionStatus.READY);
+    this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_READY, {
+      profileName,
+      revision: await this.getRevision(profileName, revisionId),
+    } satisfies RagProfileRevisionEvent);
+    return result;
+  }
+
+  /**
+   * Convenience over `reindexStagedRevision`: finds the profile's staged
+   * (`pending`/`indexing`) revision and re-indexes it.
+   * `RagService.reindexProfile` delegates here.
+   */
+  async reindexStagedProfile(profileName: string, options?: RagProfileReindexOptions): Promise<RagProfileReindexResult> {
+    const revisions = await this.listRevisions(profileName);
+    const target = revisions.find((r) => r.status === RagRevisionStatus.PENDING || r.status === RagRevisionStatus.INDEXING);
+    if (!target) {
+      throw new RagValidationError([
+        `Profile "${profileName}" has no pending revision to re-index. Call updateProfile(..., { applyStrategy: 'stage' }) ` +
+          `first, or use "reindex-and-activate" which stages and re-indexes in one call.`,
+      ]);
+    }
+    return this.reindexStagedRevision(profileName, target.id, options);
+  }
+
   private async runReindexAndActivate(
     profileName: string,
     revisionId: string,
     reindexOptions?: RagProfileReindexOptions,
   ): Promise<RagProfileReindexResult> {
-    await this.setRevisionStatus(revisionId, RagRevisionStatus.INDEXING);
-    this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_INDEXING, {
-      profileName,
-      revision: await this.getRevision(profileName, revisionId),
-    } satisfies RagProfileRevisionEvent);
-
     let result: RagProfileReindexResult;
     try {
-      result = await this.indexingService.reindexRevision(profileName, revisionId, reindexOptions);
-    } catch (error) {
-      await this.markRevisionFailed(revisionId, error);
+      result = await this.reindexStagedRevision(profileName, revisionId, reindexOptions);
+    } catch {
+      // reindexStagedRevision already marked the revision failed;
+      // `updateProfile` resolves (not rejects) on re-index failure so callers
+      // can inspect `result.revision.status` and `result.reindexResult`.
       return {
         profileName,
         revisionId,
@@ -607,15 +684,8 @@ export class RagConfigurationService {
     }
 
     if (result.status === RagOperationStatus.FAILED || !result.readyForActivation) {
-      await this.markRevisionFailed(revisionId, new Error('Re-index did not produce a ready index.'));
       return result;
     }
-
-    await this.setRevisionStatus(revisionId, RagRevisionStatus.READY);
-    this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_READY, {
-      profileName,
-      revision: await this.getRevision(profileName, revisionId),
-    } satisfies RagProfileRevisionEvent);
 
     await this.activateRevision(profileName, revisionId);
     return result;
