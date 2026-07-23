@@ -11,6 +11,13 @@ export interface RagProfileRow {
   name: string;
   description: string | null;
   activeRevisionId: string | null;
+  /**
+   * Monotonic generation of the profile's serving corpus. Every successful
+   * active-corpus mutation and every activation increments it, allowing a
+   * staged re-index to prove that the source snapshot it built from is still
+   * current at activation time.
+   */
+  indexGeneration: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -25,15 +32,15 @@ export interface RagProfileRevisionRow {
   configurationHash: string;
   changeImpact: string;
   previousRevisionId: string | null;
-  /**
-   * Id of the revision that actually *built* the index rows this revision
-   * serves. Revisions that indexed their own rows reference themselves;
-   * query-only (apply-immediately) revisions inherit their predecessor's
-   * value, so a whole query-only lineage shares one physical row set and
-   * activation/rollback never has to move rows.
-   */
+  /** Id of the revision that owns the physical index rows this revision serves. */
   dataRevisionId: string;
-  error: unknown;
+  /**
+   * Profile index generation observed when a staged re-index began. A ready
+   * revision may activate only while the active revision and this generation
+   * still match its source snapshot.
+   */
+  sourceIndexGeneration: number | null;
+  error: unknown | null;
   createdAt: Date;
   activatedAt: Date | null;
   failedAt: Date | null;

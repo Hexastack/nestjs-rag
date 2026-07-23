@@ -15,7 +15,7 @@ import {
 import { RagOperationStatus, RagRevisionStatus } from '../enums';
 import { RagChunkEmbeddingRow, RagChunkRow, RagDocumentRow, RagProfileRevisionRow, RagSourceBindingRow } from '../entities/rows';
 import { RagSchemaService } from '../entities/rag-schema.service';
-import { RagConcurrencyError, RagConfigurationError, RagProfileRevisionError, RagSourceNotFoundError } from '../errors';
+import { RagConfigurationError, RagProfileRevisionError, RagSourceNotFoundError } from '../errors';
 import { RagProfileConfiguration } from '../interfaces/profile.interface';
 import { RagDocumentInput, RagIngestOptions, RagIngestResult } from '../interfaces/ingest.interface';
 import {
@@ -41,10 +41,9 @@ interface RevisionContext {
   profileName: string;
   revisionId: string;
   /**
-   * Revision id that owns the physical index rows (documents, chunks,
-   * embeddings, FTS). Differs from `revisionId` when the revision is a
-   * query-only (apply-immediately) descendant of the revision that actually
-   * indexed — every physical read/write below must use this id.
+   * Revision id that owns the immutable physical index snapshot (documents,
+   * chunks, embeddings, FTS). Kept distinct in the context so upgraded
+   * legacy rows remain readable, although new revisions own their rows.
    */
   dataRevisionId: string;
   configuration: RagProfileConfiguration;
@@ -247,6 +246,9 @@ export class RagIndexingService {
       configuration,
       resolution: 'pinned',
     };
+    if (revision.status !== RagRevisionStatus.ACTIVE) {
+      await this.resetRevisionIndex(context);
+    }
 
     const allBindings = await this.sourceBindingRepo.find({ where: { profileName } });
     const targetBindings = options.sources
@@ -320,6 +322,24 @@ export class RagIndexingService {
   // ---------------------------------------------------------------------
   // Internal: source synchronization loop
   // ---------------------------------------------------------------------
+
+  /** A staged re-index is a replacement snapshot, including on retries. */
+  private async resetRevisionIndex(revision: RevisionContext): Promise<void> {
+    await this.dataSource.transaction(async (manager) => {
+      await this.assertRevisionWritable(manager, revision);
+      await manager.delete(this.chunkEmbeddingRepo.target, {
+        profileRevisionId: revision.dataRevisionId,
+      });
+      await manager.delete(this.chunkRepo.target, { profileRevisionId: revision.dataRevisionId });
+      await manager.delete(this.documentRepo.target, { profileRevisionId: revision.dataRevisionId });
+      if (this.schemaService.isSqlite()) {
+        await manager.query(
+          `DELETE FROM "${this.schemaService.ftsTableName()}" WHERE profile_revision_id = ?`,
+          [revision.dataRevisionId],
+        );
+      }
+    });
+  }
 
   private async syncSourceUnderRevision(
     sourceName: string,
@@ -681,12 +701,9 @@ export class RagIndexingService {
 
   /**
    * Deletes a document (and its chunks/embeddings/FTS rows) from *one*
-   * physical row set only — the one owned by `revision.dataRevisionId`. Row
-   * sets built by other re-indexes keep their copy
-   * until `cleanupArchivedRevisions` purges them, so rollback across a
-   * re-index boundary restores exactly what that revision indexed. Query-only
-   * revisions that share this data revision see the delete immediately: a
-   * query-only lineage is one live corpus, not a chain of snapshots.
+   * physical row set only — the active revision's immutable snapshot.
+   * Archived row sets keep their copy until cleanup, so rollback restores
+   * exactly what that revision served.
    */
   private async deleteDocument(revision: RevisionContext, sourceName: string, externalId: string): Promise<void> {
     const documents = await this.documentRepo.find({
@@ -766,41 +783,15 @@ export class RagIndexingService {
    * work (chunking, embedding provider round-trips), so a concurrent
    * `activateRevision` may have archived it since.
    *
-   * - `active` contexts: the profile's active revision must still serve the
-   *   same `dataRevisionId`. Comparing data lineage rather than status keeps
-   *   query-only activations harmless (they archive the old revision *row*
-   *   but keep serving its physical rows) while catching reindex activations,
-   *   where the write would otherwise land in a dead row set. On Postgres the
-   *   row is read `FOR SHARE`, so a concurrent activation's archive UPDATE
-   *   serializes against in-flight writes instead of racing them; SQLite's
-   *   single-writer transactions make the plain read sufficient (and it
-   *   supports no lock clause).
+   * - `active` contexts: configuration service locks the profile row,
+   *   verifies the exact active revision, and increments its corpus generation
+   *   in this transaction. Activation CASes that generation, so a reindexed
+   *   candidate can never hide a successful concurrent write.
    * - `pinned` contexts: the named revision must not have moved to
    *   `archived`/`failed` since resolution validated it.
    */
   private async assertRevisionWritable(manager: EntityManager, revision: RevisionContext): Promise<void> {
-    const lock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_read' } as const) : undefined;
-    if (revision.resolution === 'active') {
-      const activeRow = await manager.findOne<RagProfileRevisionRow>(this.revisionRepo.target, {
-        where: { profileName: revision.profileName, status: RagRevisionStatus.ACTIVE },
-        ...(lock ? { lock } : {}),
-      });
-      if (!activeRow || activeRow.dataRevisionId !== revision.dataRevisionId) {
-        throw new RagConcurrencyError(revision.profileName, revision.revisionId, activeRow?.id ?? 'none');
-      }
-      return;
-    }
-    const row = await manager.findOne<RagProfileRevisionRow>(this.revisionRepo.target, {
-      where: { id: revision.revisionId },
-      ...(lock ? { lock } : {}),
-    });
-    if (!row || row.status === RagRevisionStatus.ARCHIVED || row.status === RagRevisionStatus.FAILED) {
-      throw new RagProfileRevisionError(
-        `Revision "${revision.revisionId}" of profile "${revision.profileName}" changed status concurrently ` +
-          `(now: "${row?.status ?? 'deleted'}") and is no longer a valid write target.`,
-        { profileName: revision.profileName, revisionId: revision.revisionId, status: row?.status ?? null },
-      );
-    }
+    await this.configurationService.guardRevisionWrite(manager, revision);
   }
 
   private async resolveRevisionContext(profileName: string, revisionId?: string): Promise<RevisionContext> {

@@ -76,8 +76,7 @@ export class RagSearchService {
       ? await this.configurationService.getRevision(profileName, options.revisionId)
       : await this.configurationService.getActiveRevision(profileName);
     const configuration = revision.configuration;
-    // Physical rows live under the revision that built them; query-only
-    // revisions reference their indexing ancestor via dataRevisionId.
+    // Physical rows live under the revision-owned immutable snapshot.
     const dataRevisionId = revision.dataRevisionId;
     const mode = options.mode ?? configuration.retrieval.defaultMode;
 

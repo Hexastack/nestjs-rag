@@ -183,8 +183,32 @@ describe('RagSourceConfigurationService', () => {
 
       const source = await service.getSource('articles');
       expect(source.profileName).toBe('default');
-      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalled();
+      expect(indexingService.removeSourceDocuments).toHaveBeenCalledWith('customer-support', 'articles');
+      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalledWith('default', 'articles');
       expect(events.events.some((e) => e.name === 'rag.source.profile.changed')).toBe(false);
+    });
+
+    it('reindex-and-activate discards a partial target copy and keeps the old serving copy', async () => {
+      indexingService.syncSource.mockResolvedValue({
+        sourceName: 'articles',
+        status: RagOperationStatus.COMPLETED_WITH_ERRORS,
+        recordsProcessed: 2,
+        documentsIndexed: 1,
+        documentsRemoved: 0,
+        chunksCreated: 2,
+        embeddingsCreated: 0,
+        failures: 1,
+        errors: [{ externalId: '2', message: 'embedding provider unavailable' }],
+        results: [],
+      });
+
+      await expect(
+        service.assignProfile('articles', 'customer-support', { applyStrategy: 'reindex-and-activate' }),
+      ).rejects.toThrow(RagSourceConfigurationError);
+
+      expect((await service.getSource('articles')).profileName).toBe('default');
+      expect(indexingService.removeSourceDocuments).toHaveBeenCalledWith('customer-support', 'articles');
+      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalledWith('default', 'articles');
     });
 
     it('reindex-and-activate keeps the binding and the old documents when the sync throws', async () => {
@@ -196,7 +220,8 @@ describe('RagSourceConfigurationService', () => {
 
       const source = await service.getSource('articles');
       expect(source.profileName).toBe('default');
-      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalled();
+      expect(indexingService.removeSourceDocuments).toHaveBeenCalledWith('customer-support', 'articles');
+      expect(indexingService.removeSourceDocuments).not.toHaveBeenCalledWith('default', 'articles');
       expect(events.events.some((e) => e.name === 'rag.source.profile.changed')).toBe(false);
     });
   });
@@ -338,6 +363,18 @@ describe('RagSourceConfigurationService', () => {
       expect(faqBinding.profileName).toBe('support');
       const articlesBinding = await service.getSource('articles');
       expect(articlesBinding.profileName).toBe('default'); // untouched
+    });
+
+    it('rejects invalid code-supplied overrides before persisting a binding', async () => {
+      registry.register({
+        name: 'broken',
+        kind: 'table',
+        defaultProfileName: 'support',
+        defaultChunkingOverrides: { chunkSize: 10 },
+      } as any);
+
+      await expect(service.seedBindings()).rejects.toThrow(RagSourceConfigurationError);
+      expect(await ctx.repos.sourceBinding.findOne({ where: { sourceName: 'broken' } })).toBeNull();
     });
   });
 });

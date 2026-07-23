@@ -21,6 +21,7 @@ export class InitRagSchema1700000000001 implements MigrationInterface {
         "name" varchar(200) NOT NULL UNIQUE,
         "description" varchar(2000),
         "active_revision_id" varchar(36),
+        "index_generation" integer NOT NULL DEFAULT 0,
         "created_at" timestamp NOT NULL DEFAULT now(),
         "updated_at" timestamp NOT NULL DEFAULT now()
       )
@@ -38,6 +39,7 @@ export class InitRagSchema1700000000001 implements MigrationInterface {
         "change_impact" varchar(32) NOT NULL,
         "previous_revision_id" varchar(36),
         "data_revision_id" varchar(36) NOT NULL,
+        "source_index_generation" integer,
         "error" text,
         "created_at" timestamp NOT NULL DEFAULT now(),
         "activated_at" timestamp,

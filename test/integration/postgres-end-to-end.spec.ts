@@ -151,6 +151,31 @@ describe('RAG integration (PostgreSQL + pgvector)', () => {
     expect(results[0].chunk.content).toContain('router');
     expect(results[0].embeddingScore).toBeDefined();
 
+    const original = await configurationService.getActiveRevision('kb');
+    const queryOnly = await configurationService.updateProfile(
+      'kb',
+      { searchDefaults: { topK: 4 } },
+      { applyStrategy: 'apply-immediately' },
+    );
+    expect(queryOnly.revision.dataRevisionId).toBe(queryOnly.revision.id);
+    expect(
+      (await ragService.search('fiber router installation', {
+        profileName: 'kb',
+        mode: RagRetrievalMode.EMBEDDING,
+      })).some((result) => result.chunk.content.includes('router')),
+    ).toBe(true);
+
+    await ragService.ingest(
+      { externalId: 'late', content: 'Satellite antenna calibration added after the snapshot' },
+      { profileName: 'kb' },
+    );
+    await configurationService.rollback('kb', original.id);
+    const rolledBackResults = await ragService.search('satellite antenna', {
+      profileName: 'kb',
+      mode: RagRetrievalMode.EMBEDDING,
+    });
+    expect(rolledBackResults.some((result) => result.chunk.content.includes('Satellite antenna'))).toBe(false);
+
     await app.close();
   }, 60000);
 

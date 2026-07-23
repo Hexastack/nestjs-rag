@@ -39,6 +39,7 @@ function revisionRow(id: string, revisionNumber: number, status: string, overrid
     changeImpact: 'none',
     previousRevisionId: null,
     dataRevisionId: id,
+    sourceIndexGeneration: null,
     error: null,
     createdAt: new Date(),
     activatedAt: null,
@@ -67,7 +68,12 @@ class InMemorySourceProvider implements RagSourceProvider {
 
 describe('RagIndexingService', () => {
   let ctx: SqliteTestContext;
-  let configurationService: { getActiveRevision: jest.Mock; getRevision: jest.Mock; listRevisions: jest.Mock };
+  let configurationService: {
+    getActiveRevision: jest.Mock;
+    getRevision: jest.Mock;
+    listRevisions: jest.Mock;
+    guardRevisionWrite: jest.Mock;
+  };
   let sourceRegistry: RagSourceRegistry;
   let service: RagIndexingService;
   let embeddingService: { embedMany: jest.Mock; embedQuery: jest.Mock };
@@ -77,16 +83,58 @@ describe('RagIndexingService', () => {
     const revision = lexicalRevision('rev-1');
     configurationService = {
       getActiveRevision: jest.fn().mockResolvedValue(revision),
-      getRevision: jest.fn().mockImplementation(async (_p: string, id: string) => lexicalRevision(id)),
+      getRevision: jest.fn().mockImplementation(async (_p: string, id: string) => ({
+        ...lexicalRevision(id),
+        status: id === 'rev-1' ? RagRevisionStatus.ACTIVE : RagRevisionStatus.PENDING,
+      })),
       listRevisions: jest.fn().mockResolvedValue([]),
+      guardRevisionWrite: jest.fn(),
     };
     sourceRegistry = new RagSourceRegistry();
     embeddingService = { embedMany: jest.fn().mockResolvedValue([]), embedQuery: jest.fn() };
 
+    await ctx.repos.profile.save({
+      id: 'profile-1',
+      name: 'default',
+      description: null,
+      activeRevisionId: 'rev-1',
+      indexGeneration: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
     await ctx.repos.profileRevision.save([
       revisionRow('rev-1', 1, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }),
       revisionRow('rev-2', 2, RagRevisionStatus.PENDING),
     ] as any);
+    configurationService.guardRevisionWrite.mockImplementation(async (manager: any, target: any) => {
+      const profile = await manager.findOne(ctx.schemas.profile, { where: { name: target.profileName } });
+      const row = await manager.findOne(ctx.schemas.profileRevision, { where: { id: target.revisionId } });
+      const targetsActive = target.resolution === 'active' || profile?.activeRevisionId === target.revisionId;
+      if (targetsActive) {
+        if (
+          !profile ||
+          profile.activeRevisionId !== target.revisionId ||
+          row?.status !== RagRevisionStatus.ACTIVE ||
+          row.dataRevisionId !== target.dataRevisionId
+        ) {
+          throw new RagConcurrencyError(target.profileName, target.revisionId, profile?.activeRevisionId ?? 'none');
+        }
+        await manager.update(
+          ctx.schemas.profile,
+          { id: profile.id },
+          { indexGeneration: profile.indexGeneration + 1 },
+        );
+        return;
+      }
+      if (
+        !row ||
+        row.dataRevisionId !== target.dataRevisionId ||
+        row.status === RagRevisionStatus.ARCHIVED ||
+        row.status === RagRevisionStatus.FAILED
+      ) {
+        throw new RagProfileRevisionError(`Revision "${target.revisionId}" is no longer writable.`);
+      }
+    });
 
     service = new RagIndexingService(
       ctx.repos.document as any,
@@ -423,6 +471,25 @@ describe('RagIndexingService', () => {
       const rev2Docs = await ctx.repos.document.count({ where: { profileRevisionId: 'rev-2' } });
       expect(rev2Docs).toBe(1);
     });
+
+    it('clears a previous staged candidate before retrying the re-index', async () => {
+      await service.ingest(
+        { externalId: 'stale', content: 'This record must not survive the retry.' },
+        { revisionId: 'rev-2' },
+      );
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: 'rev-2' } })).toBe(1);
+
+      const result = await service.reindexRevision('default', 'rev-2', { sources: [] });
+
+      expect(result.readyForActivation).toBe(true);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: 'rev-2' } })).toBe(0);
+      expect(await ctx.repos.chunk.count({ where: { profileRevisionId: 'rev-2' } })).toBe(0);
+      const ftsRows = await ctx.dataSource.query(
+        `SELECT COUNT(*) AS "count" FROM "rag_chunks_fts" WHERE profile_revision_id = ?`,
+        ['rev-2'],
+      );
+      expect(Number(ftsRows[0].count)).toBe(0);
+    });
   });
 
   describe('revision write guards', () => {
@@ -434,20 +501,23 @@ describe('RagIndexingService', () => {
       await ctx.repos.profileRevision.save(
         revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }) as any,
       );
+      await ctx.repos.profile.update({ id: 'profile-1' }, { activeRevisionId: 'rev-3' });
 
       await expect(service.ingest({ externalId: 'doc-1', content: 'lands nowhere' })).rejects.toThrow(RagConcurrencyError);
       expect(await ctx.repos.document.count()).toBe(0);
     });
 
-    it('allows an ingest across a query-only activation (same data lineage, different active revision row)', async () => {
+    it('rejects an ingest resolved before a query-only snapshot activation', async () => {
       await ctx.repos.profileRevision.update({ id: 'rev-1' }, { status: RagRevisionStatus.ARCHIVED });
       await ctx.repos.profileRevision.save(
-        revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { dataRevisionId: 'rev-1', activatedAt: new Date() }) as any,
+        revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }) as any,
       );
+      await ctx.repos.profile.update({ id: 'profile-1' }, { activeRevisionId: 'rev-3' });
 
-      const result = await service.ingest({ externalId: 'doc-1', content: 'still lands in the live corpus' });
-      expect(result.skipped).toBe(false);
-      expect(await ctx.repos.document.count({ where: { profileRevisionId: 'rev-1' } })).toBe(1);
+      await expect(service.ingest({ externalId: 'doc-1', content: 'must retry against the new snapshot' })).rejects.toThrow(
+        RagConcurrencyError,
+      );
+      expect(await ctx.repos.document.count()).toBe(0);
     });
 
     it('rejects an explicit revisionId that targets an archived or failed revision', async () => {
@@ -486,6 +556,7 @@ describe('RagIndexingService', () => {
       await ctx.repos.profileRevision.save(
         revisionRow('rev-3', 3, RagRevisionStatus.ACTIVE, { activatedAt: new Date() }) as any,
       );
+      await ctx.repos.profile.update({ id: 'profile-1' }, { activeRevisionId: 'rev-3' });
 
       await expect(service.removeSourceRecord('kb', '1')).rejects.toThrow(RagConcurrencyError);
       // The archived snapshot keeps its document.

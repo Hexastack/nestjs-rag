@@ -18,6 +18,7 @@ export class InitRagSchema1700000000001 implements MigrationInterface {
         "name" varchar(200) NOT NULL,
         "description" varchar(2000),
         "active_revision_id" varchar(36),
+        "index_generation" integer NOT NULL DEFAULT 0,
         "created_at" datetime NOT NULL DEFAULT (datetime('now')),
         "updated_at" datetime NOT NULL DEFAULT (datetime('now')),
         CONSTRAINT "uq_rag_profiles_name" UNIQUE ("name")
@@ -36,6 +37,7 @@ export class InitRagSchema1700000000001 implements MigrationInterface {
         "change_impact" varchar(32) NOT NULL,
         "previous_revision_id" varchar(36),
         "data_revision_id" varchar(36) NOT NULL,
+        "source_index_generation" integer,
         "error" text,
         "created_at" datetime NOT NULL DEFAULT (datetime('now')),
         "activated_at" datetime,

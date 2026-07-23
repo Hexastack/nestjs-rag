@@ -122,6 +122,87 @@ export class RagConfigurationService {
     return rows.map(rowToRevision);
   }
 
+  /**
+   * Internal indexing hook: validates a write target while holding the
+   * profile row lock and advances the serving corpus generation in the same
+   * transaction for active writes. Staged-revision writes remain isolated
+   * and do not affect the active generation.
+   */
+  async guardRevisionWrite(
+    manager: EntityManager,
+    target: {
+      profileName: string;
+      revisionId: string;
+      dataRevisionId: string;
+      resolution: 'active' | 'pinned';
+    },
+  ): Promise<void> {
+    const profileLock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_write' } as const) : undefined;
+    const profile = await manager.findOne<RagProfileRow>(this.profileRepo.target, {
+      where: { name: target.profileName },
+      ...(profileLock ? { lock: profileLock } : {}),
+    });
+    const targetsActiveRevision =
+      target.resolution === 'active' || (!!profile && profile.activeRevisionId === target.revisionId);
+
+    if (targetsActiveRevision) {
+      if (!profile || profile.activeRevisionId !== target.revisionId) {
+        throw new RagConcurrencyError(
+          target.profileName,
+          target.revisionId,
+          profile?.activeRevisionId ?? 'none',
+        );
+      }
+      const activeRow = await manager.findOne<RagProfileRevisionRow>(this.revisionRepo.target, {
+        where: { id: target.revisionId, status: RagRevisionStatus.ACTIVE },
+      });
+      if (!activeRow || activeRow.dataRevisionId !== target.dataRevisionId) {
+        throw new RagConcurrencyError(
+          target.profileName,
+          target.revisionId,
+          activeRow?.id ?? profile.activeRevisionId ?? 'none',
+        );
+      }
+      const bumped = await manager.update(
+        this.profileRepo.target,
+        {
+          id: profile.id,
+          activeRevisionId: target.revisionId,
+          indexGeneration: profile.indexGeneration,
+        },
+        {
+          indexGeneration: profile.indexGeneration + 1,
+          updatedAt: new Date(),
+        },
+      );
+      if (!bumped.affected) {
+        throw new RagConcurrencyError(target.profileName, target.revisionId, 'changed-during-write');
+      }
+      return;
+    }
+
+    const revisionLock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_read' } as const) : undefined;
+    const row = await manager.findOne<RagProfileRevisionRow>(this.revisionRepo.target, {
+      where: { id: target.revisionId },
+      ...(revisionLock ? { lock: revisionLock } : {}),
+    });
+    if (
+      !row ||
+      row.dataRevisionId !== target.dataRevisionId ||
+      row.status === RagRevisionStatus.ARCHIVED ||
+      row.status === RagRevisionStatus.FAILED
+    ) {
+      throw new RagProfileRevisionError(
+        `Revision "${target.revisionId}" of profile "${target.profileName}" changed concurrently and is no longer a valid write target.`,
+        {
+          profileName: target.profileName,
+          revisionId: target.revisionId,
+          status: row?.status ?? null,
+        },
+      );
+    }
+  }
+
   // ---------------------------------------------------------------------
   // Profile lifecycle
   // ---------------------------------------------------------------------
@@ -155,6 +236,7 @@ export class RagConfigurationService {
         name: input.name,
         description: configuration.description ?? null,
         activeRevisionId: null,
+        indexGeneration: 0,
         createdAt: now,
         updatedAt: now,
       });
@@ -169,6 +251,7 @@ export class RagConfigurationService {
         changeImpact: RagChangeImpact.NONE,
         previousRevisionId: null,
         dataRevisionId: revisionId,
+        sourceIndexGeneration: null,
         error: null,
         createdAt: now,
         activatedAt: now,
@@ -246,8 +329,8 @@ export class RagConfigurationService {
    *
    * - `validate-only` — validate and classify the change; persist nothing.
    * - `apply-immediately` — only for query-only changes: creates and
-   *   activates a new revision that shares the existing index rows via its
-   *   `dataRevisionId` (throws `RagReindexRequiredError` otherwise).
+   *   activates a new revision with an independent copy of the current index
+   *   snapshot (throws `RagReindexRequiredError` otherwise).
    * - `stage` — persists a `pending` revision to be re-indexed later.
    * - `reindex-and-activate` — stages, re-indexes, and activates in one
    *   call (falling back to the immediate path when no re-index is needed).
@@ -332,15 +415,29 @@ export class RagConfigurationService {
       );
     }
 
-    // Index rows always stay with the revision that built them
-    // (`dataRevisionId`); a query-only revision references its indexing
-    // ancestor's row set instead of owning rows. Activation — including
-    // rollback in either direction across a query-only lineage — is
-    // therefore a pure pointer flip and never moves rows.
     await this.validateIndexConsistency(revisionRow);
 
     const now = new Date();
     const expectedActiveId = profileRow.activeRevisionId;
+    const expectedGeneration = profileRow.indexGeneration;
+    if (revisionRow.status === RagRevisionStatus.READY && revisionRow.previousRevisionId !== expectedActiveId) {
+      throw new RagProfileActivationError(
+        `Revision "${revisionId}" was prepared from revision "${revisionRow.previousRevisionId ?? 'none'}", but ` +
+          `profile "${profileName}" now serves revision "${expectedActiveId ?? 'none'}". Create a new staged update ` +
+          `from the current configuration instead of activating this stale patch.`,
+      );
+    }
+    if (
+      revisionRow.status === RagRevisionStatus.READY &&
+      (revisionRow.sourceIndexGeneration === null ||
+        revisionRow.sourceIndexGeneration !== expectedGeneration)
+    ) {
+      throw new RagProfileActivationError(
+        `Revision "${revisionId}" was indexed at corpus generation ` +
+          `"${revisionRow.sourceIndexGeneration ?? 'unknown'}", but profile "${profileName}" is now at generation ` +
+          `"${expectedGeneration}". Re-index the staged revision again before activation.`,
+      );
+    }
     await this.dataSource.transaction(async (manager) => {
       // Compare-and-swap: only flip the pointer if it still is what we
       // loaded above — the status/consistency checks ran against that
@@ -351,15 +448,26 @@ export class RagConfigurationService {
       // activation and rollback alike — must carry it along.
       const flip = await manager.update(
         this.profileRepo.target,
-        { id: profileRow.id, activeRevisionId: expectedActiveId ?? IsNull() },
+        {
+          id: profileRow.id,
+          activeRevisionId: expectedActiveId ?? IsNull(),
+          indexGeneration: expectedGeneration,
+        },
         {
           activeRevisionId: revisionId,
           description: (revisionRow.configuration as RagProfileConfiguration).description ?? null,
+          indexGeneration: expectedGeneration + 1,
           updatedAt: now,
         },
       );
       if (!flip.affected) {
         const fresh = await manager.findOne(this.profileRepo.target, { where: { id: profileRow.id } });
+        if (fresh?.activeRevisionId === expectedActiveId && fresh.indexGeneration !== expectedGeneration) {
+          throw new RagProfileActivationError(
+            `Revision "${revisionId}" became stale because profile "${profileName}" changed from corpus generation ` +
+              `"${expectedGeneration}" to "${fresh.indexGeneration}" during activation. Re-index it again.`,
+          );
+        }
         throw new RagConcurrencyError(profileName, expectedActiveId ?? 'none', fresh?.activeRevisionId ?? 'none');
       }
       // Archive before activating so the one-active-per-profile partial
@@ -427,12 +535,8 @@ export class RagConfigurationService {
     const toDelete = archived.slice(keep);
     const deleted: string[] = [];
     for (const rev of toDelete) {
-      // A query-only lineage shares its indexing ancestor's physical rows
-      // (`dataRevisionId`), so this revision's rows may still be served by
-      // the active revision or by a retained archived one. Skip it while any
-      // other revision references it; checked per revision inside the loop
-      // (newest-first), so purging a referencing successor in this same run
-      // unblocks its ancestor.
+      // New revisions own their snapshots, but retain this reference guard
+      // defensively for databases imported from a pre-release schema.
       const referencedBy = await this.revisionRepo
         .createQueryBuilder('r')
         .where('r.dataRevisionId = :id', { id: rev.id })
@@ -521,7 +625,7 @@ export class RagConfigurationService {
       changeImpact: diff.impact,
       createdAt: new Date(),
       previousRevisionId: activeRow.id,
-      dataRevisionId: diff.canApplyImmediately ? activeRow.dataRevisionId : id,
+      dataRevisionId: id,
     };
   }
 
@@ -533,24 +637,37 @@ export class RagConfigurationService {
   ): Promise<RagProfileRevision> {
     const id = newId();
     const now = new Date();
-    const revisionNumber = await this.nextRevisionNumber(profileRow.id);
-    await this.revisionRepo.save({
-      id,
-      profileId: profileRow.id,
-      profileName: profileRow.name,
-      revisionNumber,
-      status: RagRevisionStatus.PENDING,
-      configuration: proposed,
-      configurationHash: hashConfiguration(proposed),
-      changeImpact: diff.impact,
-      previousRevisionId: previousRow.id,
-      // A staged revision is re-indexed before activation, so it owns its
-      // own physical row set.
-      dataRevisionId: id,
-      error: null,
-      createdAt: now,
-      activatedAt: null,
-      failedAt: null,
+    await this.dataSource.transaction(async (manager) => {
+      const lock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_write' } as const) : undefined;
+      const currentProfile = await manager.findOne<RagProfileRow>(this.profileRepo.target, {
+        where: { id: profileRow.id },
+        ...(lock ? { lock } : {}),
+      });
+      if (!currentProfile || currentProfile.activeRevisionId !== previousRow.id) {
+        throw new RagConcurrencyError(
+          profileRow.name,
+          previousRow.id,
+          currentProfile?.activeRevisionId ?? 'none',
+        );
+      }
+      const revisionNumber = await this.nextRevisionNumber(profileRow.id, manager);
+      await manager.save(this.revisionRepo.target, {
+        id,
+        profileId: profileRow.id,
+        profileName: profileRow.name,
+        revisionNumber,
+        status: RagRevisionStatus.PENDING,
+        configuration: proposed,
+        configurationHash: hashConfiguration(proposed),
+        changeImpact: diff.impact,
+        previousRevisionId: previousRow.id,
+        dataRevisionId: id,
+        sourceIndexGeneration: null,
+        error: null,
+        createdAt: now,
+        activatedAt: null,
+        failedAt: null,
+      });
     });
     const revision = await this.getRevision(profileRow.name, id);
     this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_CREATED, {
@@ -562,12 +679,10 @@ export class RagConfigurationService {
 
   /**
    * Implements the "apply-immediately" fast path for query-only changes: no
-   * chunk or embedding regenerates. A new, immutable revision row is created
-   * that *shares* its predecessor's physical row set by inheriting its
-   * `dataRevisionId` — index rows are never moved or copied, so activation
-   * is a pure pointer flip, far cheaper than re-chunking/re-embedding, and
-   * correct because, by construction, only query-only paths (topK, RRF
-   * weights, retrieval mode, ...) changed.
+   * chunking or embedding provider calls are repeated, but the physical rows
+   * are cloned under the new revision id. Each archived revision therefore
+   * remains an immutable corpus snapshot and rollback restores exactly what
+   * that revision served.
    */
   private async applyImmediateRevision(
     profileRow: RagProfileRow,
@@ -577,9 +692,9 @@ export class RagConfigurationService {
   ): Promise<RagProfileRevision> {
     const newRevisionId = newId();
     const now = new Date();
-    const nextNumber = await this.nextRevisionNumber(profileRow.id);
 
     await this.dataSource.transaction(async (manager) => {
+      const nextNumber = await this.nextRevisionNumber(profileRow.id, manager);
       // Compare-and-swap: the pointer flip only succeeds if the active
       // revision is still the one this change was prepared (and, when
       // provided, `expectedRevisionId`-checked) against. A concurrent writer
@@ -591,8 +706,17 @@ export class RagConfigurationService {
       // and getProfile() serves the row's copy.
       const flip = await manager.update(
         this.profileRepo.target,
-        { id: profileRow.id, activeRevisionId: activeRow.id },
-        { activeRevisionId: newRevisionId, description: proposed.description ?? null, updatedAt: now },
+        {
+          id: profileRow.id,
+          activeRevisionId: activeRow.id,
+          indexGeneration: profileRow.indexGeneration,
+        },
+        {
+          activeRevisionId: newRevisionId,
+          description: proposed.description ?? null,
+          indexGeneration: profileRow.indexGeneration + 1,
+          updatedAt: now,
+        },
       );
       if (!flip.affected) {
         const fresh = await manager.findOne(this.profileRepo.target, { where: { id: profileRow.id } });
@@ -607,6 +731,7 @@ export class RagConfigurationService {
         { id: activeRow.id, status: RagRevisionStatus.ACTIVE },
         { status: RagRevisionStatus.ARCHIVED },
       );
+      await this.cloneRevisionIndexRows(manager, activeRow.dataRevisionId, newRevisionId);
       await manager.save(this.revisionRepo.target, {
         id: newRevisionId,
         profileId: profileRow.id,
@@ -617,13 +742,15 @@ export class RagConfigurationService {
         configurationHash: hashConfiguration(proposed),
         changeImpact: diff.impact,
         previousRevisionId: activeRow.id,
-        dataRevisionId: activeRow.dataRevisionId,
+        dataRevisionId: newRevisionId,
+        sourceIndexGeneration: null,
         error: null,
         createdAt: now,
         activatedAt: now,
         failedAt: null,
       });
     });
+    await this.ensureAuxiliaryIndexesFor(newRevisionId, proposed);
 
     const revision = await this.getRevision(profileRow.name, newRevisionId);
     this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_CREATED, {
@@ -646,10 +773,10 @@ export class RagConfigurationService {
    * `RagIndexingService.reindexRevision` never touches revision status.
    * `RagService.reindexRevision` delegates here.
    *
-   * Only revisions in a staged lifecycle state (`pending`, `indexing`,
-   * `failed`) are transitioned. Any other revision (e.g. the active one,
-   * re-indexed in place) is re-indexed as-is, so its status is never
-   * corrupted.
+   * Revisions in a staged lifecycle state (`pending`, `ready`, `failed`) are
+   * transitioned. Retrying a ready/failed revision first clears its candidate
+   * rows, so the rebuilt snapshot cannot retain stale records. An active
+   * revision is re-indexed as-is and its status is never corrupted.
    *
    * Throws whatever the re-index throws (after marking the revision
    * `failed`); a re-index that completes but does not produce a ready index
@@ -663,11 +790,11 @@ export class RagConfigurationService {
     const revisionRow = await this.findRevisionRowOrThrow(profileName, revisionId);
     const staged =
       revisionRow.status === RagRevisionStatus.PENDING ||
-      revisionRow.status === RagRevisionStatus.INDEXING ||
+      revisionRow.status === RagRevisionStatus.READY ||
       revisionRow.status === RagRevisionStatus.FAILED;
 
     if (staged) {
-      await this.setRevisionStatus(revisionId, RagRevisionStatus.INDEXING);
+      await this.beginStagedReindex(revisionRow);
       this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_INDEXING, {
         profileName,
         revision: await this.getRevision(profileName, revisionId),
@@ -693,7 +820,22 @@ export class RagConfigurationService {
       return result;
     }
 
-    await this.setRevisionStatus(revisionId, RagRevisionStatus.READY);
+    const currentRevision = await this.findRevisionRowOrThrow(profileName, revisionId);
+    const markedReady = await this.completeStagedReindex(currentRevision);
+    if (!markedReady) {
+      const error = new RagProfileActivationError(
+        `Revision "${revisionId}" finished indexing after its source corpus changed. Its candidate index was ` +
+          `discarded; retry it if the active revision is unchanged, or create a new staged update if the active ` +
+          `configuration changed.`,
+      );
+      await this.markRevisionFailed(revisionId, error);
+      return {
+        ...result,
+        status: RagOperationStatus.FAILED,
+        failures: result.failures + 1,
+        readyForActivation: false,
+      };
+    }
     this.eventEmitter.emit(RagEventNames.PROFILE_REVISION_READY, {
       profileName,
       revision: await this.getRevision(profileName, revisionId),
@@ -702,16 +844,21 @@ export class RagConfigurationService {
   }
 
   /**
-   * Convenience over `reindexStagedRevision`: finds the profile's staged
-   * (`pending`/`indexing`) revision and re-indexes it.
+   * Convenience over `reindexStagedRevision`: finds the newest staged
+   * (`pending`/`ready`/`failed`) revision and re-indexes it.
    * `RagService.reindexProfile` delegates here.
    */
   async reindexStagedProfile(profileName: string, options?: RagProfileReindexOptions): Promise<RagProfileReindexResult> {
     const revisions = await this.listRevisions(profileName);
-    const target = revisions.find((r) => r.status === RagRevisionStatus.PENDING || r.status === RagRevisionStatus.INDEXING);
+    const target = revisions.find(
+      (r) =>
+        r.status === RagRevisionStatus.PENDING ||
+        r.status === RagRevisionStatus.READY ||
+        r.status === RagRevisionStatus.FAILED,
+    );
     if (!target) {
       throw new RagValidationError([
-        `Profile "${profileName}" has no pending revision to re-index. Call updateProfile(..., { applyStrategy: 'stage' }) ` +
+        `Profile "${profileName}" has no staged revision to re-index. Call updateProfile(..., { applyStrategy: 'stage' }) ` +
           `first, or use "reindex-and-activate" which stages and re-indexes in one call.`,
       ]);
     }
@@ -809,6 +956,98 @@ export class RagConfigurationService {
     }
   }
 
+  /** Clones one immutable physical index snapshot without re-chunking or re-embedding. */
+  private async cloneRevisionIndexRows(
+    manager: EntityManager,
+    sourceDataRevisionId: string,
+    targetDataRevisionId: string,
+  ): Promise<void> {
+    const documents = await manager.find<RagDocumentRow>(this.documentRepo.target, {
+      where: { profileRevisionId: sourceDataRevisionId },
+    });
+    if (documents.length === 0) return;
+
+    const chunks = await manager.find<RagChunkRow>(this.chunkRepo.target, {
+      where: { profileRevisionId: sourceDataRevisionId },
+    });
+    const embeddings = await manager.find<RagChunkEmbeddingRow>(this.chunkEmbeddingRepo.target, {
+      where: { profileRevisionId: sourceDataRevisionId },
+    });
+    const documentIds = new Map(documents.map((document) => [document.id, newId()]));
+    const chunkIds = new Map(chunks.map((chunk) => [chunk.id, newId()]));
+
+    const clonedDocuments: RagDocumentRow[] = documents.map((document) => ({
+      ...document,
+      id: documentIds.get(document.id)!,
+      profileRevisionId: targetDataRevisionId,
+    }));
+    const clonedChunks: RagChunkRow[] = chunks.map((chunk) => ({
+      ...chunk,
+      id: chunkIds.get(chunk.id)!,
+      profileRevisionId: targetDataRevisionId,
+      documentId: documentIds.get(chunk.documentId)!,
+    }));
+    const clonedEmbeddings: RagChunkEmbeddingRow[] = embeddings.map((embedding) => ({
+      ...embedding,
+      id: newId(),
+      profileRevisionId: targetDataRevisionId,
+      chunkId: chunkIds.get(embedding.chunkId)!,
+      embedding: Array.isArray(embedding.embedding) ? [...embedding.embedding] : embedding.embedding,
+    }));
+
+    await manager.save(this.documentRepo.target, clonedDocuments, { chunk: 100 });
+    if (clonedChunks.length > 0) {
+      await manager.save(this.chunkRepo.target, clonedChunks, { chunk: 100 });
+    }
+    if (clonedEmbeddings.length > 0) {
+      await manager.save(this.chunkEmbeddingRepo.target, clonedEmbeddings, { chunk: 100 });
+    }
+
+    if (this.schemaService.isSqlite()) {
+      const documentsById = new Map(clonedDocuments.map((document) => [document.id, document]));
+      for (const chunk of clonedChunks) {
+        const document = documentsById.get(chunk.documentId)!;
+        await manager.query(
+          `INSERT INTO "${this.schemaService.ftsTableName()}" ` +
+            `(content, chunk_id, profile_revision_id, document_id, source_name, namespace) VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            chunk.content,
+            chunk.id,
+            targetDataRevisionId,
+            document.id,
+            document.sourceName,
+            document.namespace,
+          ],
+        );
+      }
+    }
+  }
+
+  private async ensureAuxiliaryIndexesFor(
+    dataRevisionId: string,
+    configuration: RagProfileConfiguration,
+  ): Promise<void> {
+    if (!this.schemaService.isPostgres()) return;
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    try {
+      await this.schemaService.ensureLexicalIndexForRevision(
+        queryRunner,
+        dataRevisionId,
+        configuration.retrieval.lexical?.language ?? 'simple',
+      );
+      if (configuration.retrieval.embedding) {
+        await this.schemaService.ensureVectorIndexForRevision(
+          queryRunner,
+          dataRevisionId,
+          configuration.retrieval.embedding.dimensions,
+        );
+      }
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   private async dropAuxiliaryIndexesFor(revisionRow: RagProfileRevisionRow): Promise<void> {
     if (!this.schemaService.isPostgres()) return;
     const configuration = revisionRow.configuration as RagProfileConfiguration;
@@ -843,12 +1082,73 @@ export class RagConfigurationService {
     this.logger.warn(`Revision "${revisionId}" failed: ${(error as Error)?.message ?? error}`);
   }
 
-  private async setRevisionStatus(revisionId: string, status: RagRevisionStatus): Promise<void> {
-    await this.revisionRepo.update({ id: revisionId }, { status });
+  private async beginStagedReindex(revisionRow: RagProfileRevisionRow): Promise<void> {
+    await this.dataSource.transaction(async (manager) => {
+      const lock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_write' } as const) : undefined;
+      const profile = await manager.findOne<RagProfileRow>(this.profileRepo.target, {
+        where: { id: revisionRow.profileId },
+        ...(lock ? { lock } : {}),
+      });
+      if (!profile || profile.activeRevisionId !== revisionRow.previousRevisionId) {
+        throw new RagConcurrencyError(
+          revisionRow.profileName,
+          revisionRow.previousRevisionId ?? 'none',
+          profile?.activeRevisionId ?? 'none',
+        );
+      }
+      const started = await manager.update(
+        this.revisionRepo.target,
+        {
+          id: revisionRow.id,
+          status: In([RagRevisionStatus.PENDING, RagRevisionStatus.READY, RagRevisionStatus.FAILED]),
+        },
+        {
+          status: RagRevisionStatus.INDEXING,
+          sourceIndexGeneration: profile.indexGeneration,
+          error: () => 'NULL',
+          failedAt: () => 'NULL',
+        },
+      );
+      if (!started.affected) {
+        throw new RagProfileRevisionError(
+          `Revision "${revisionRow.id}" is already being indexed or is no longer staged.`,
+          { profileName: revisionRow.profileName, revisionId: revisionRow.id },
+        );
+      }
+    });
   }
 
-  private async nextRevisionNumber(profileId: string): Promise<number> {
-    const raw = await this.revisionRepo
+  private async completeStagedReindex(revisionRow: RagProfileRevisionRow): Promise<boolean> {
+    return this.dataSource.transaction(async (manager) => {
+      const lock = this.schemaService.isPostgres() ? ({ mode: 'pessimistic_write' } as const) : undefined;
+      const profile = await manager.findOne<RagProfileRow>(this.profileRepo.target, {
+        where: { id: revisionRow.profileId },
+        ...(lock ? { lock } : {}),
+      });
+      if (
+        !profile ||
+        profile.activeRevisionId !== revisionRow.previousRevisionId ||
+        revisionRow.sourceIndexGeneration === null ||
+        profile.indexGeneration !== revisionRow.sourceIndexGeneration
+      ) {
+        return false;
+      }
+      const ready = await manager.update(
+        this.revisionRepo.target,
+        {
+          id: revisionRow.id,
+          status: RagRevisionStatus.INDEXING,
+          sourceIndexGeneration: revisionRow.sourceIndexGeneration,
+        },
+        { status: RagRevisionStatus.READY, error: () => 'NULL', failedAt: () => 'NULL' },
+      );
+      return !!ready.affected;
+    });
+  }
+
+  private async nextRevisionNumber(profileId: string, manager?: EntityManager): Promise<number> {
+    const repository = manager ? manager.getRepository(this.revisionRepo.target) : this.revisionRepo;
+    const raw = await repository
       .createQueryBuilder('r')
       .select('MAX(r.revisionNumber)', 'max')
       .where('r.profileId = :profileId', { profileId })

@@ -8,7 +8,7 @@ import { RagService } from '../../src/rag.service';
 import { RagConfigurationService } from '../../src/config/rag-configuration.service';
 import { RagSourceConfigurationService } from '../../src/source/rag-source-configuration.service';
 import { RagDatabaseType, RagChunkingStrategy, RagRetrievalMode, RagRevisionStatus } from '../../src/enums';
-import { RagValidationError } from '../../src/errors';
+import { RagProfileActivationError, RagValidationError } from '../../src/errors';
 import { RagProfileConfiguration } from '../../src/interfaces/profile.interface';
 
 /**
@@ -117,7 +117,7 @@ describe('RAG integration (SQLite, lexical-only)', () => {
       { applyStrategy: 'apply-immediately' },
     );
     expect(result.revision.status).toBe(RagRevisionStatus.ACTIVE);
-    expect(result.revision.id).not.toBe(before.id); // new revision row, but re-pointed, not re-indexed
+    expect(result.revision.id).not.toBe(before.id); // new revision and copied snapshot, without re-indexing
     expect((await configurationService.listRevisions('default')).length).toBe(2);
     await app.close();
   });
@@ -175,6 +175,35 @@ describe('RAG integration (SQLite, lexical-only)', () => {
 
     const results = await ragService.search('lighthouses');
     expect(results.length).toBeGreaterThan(0);
+    await app.close();
+  });
+
+  it('refuses a reindex cutover after a successful concurrent active write, then succeeds after retry', async () => {
+    const app = await buildApp();
+    const ragService = app.get(RagService);
+    const configurationService = app.get(RagConfigurationService);
+
+    await ragService.ingest({ externalId: 'cutover-base', content: 'Base notes about observatories.' });
+    const staged = await configurationService.updateProfile(
+      'default',
+      { chunking: { chunkSize: 88, chunkOverlap: 8 } },
+      { applyStrategy: 'stage' },
+    );
+    expect((await ragService.reindexRevision('default', staged.revision.id)).readyForActivation).toBe(true);
+
+    // This write lands after the candidate became ready. Activation must
+    // reject that stale candidate rather than hide the successful write.
+    await ragService.ingest({ externalId: 'cutover-late', content: 'Late notes about astrolabes.' });
+    await expect(
+      configurationService.activateRevision('default', staged.revision.id),
+    ).rejects.toThrow(RagProfileActivationError);
+    expect((await ragService.search('astrolabes')).length).toBeGreaterThan(0);
+
+    // Retrying starts from an empty candidate and records the new corpus
+    // generation, so it includes the late write and can activate safely.
+    expect((await ragService.reindexRevision('default', staged.revision.id)).readyForActivation).toBe(true);
+    await configurationService.activateRevision('default', staged.revision.id);
+    expect((await ragService.search('astrolabes')).length).toBeGreaterThan(0);
     await app.close();
   });
 
@@ -239,7 +268,7 @@ describe('RAG integration (SQLite, lexical-only)', () => {
     await app.close();
   });
 
-  it('still serves indexed content after rolling back across an apply-immediately revision (rows are shared, never moved)', async () => {
+  it('still serves indexed content after rolling back across an apply-immediately snapshot', async () => {
     const app = await buildApp();
     const ragService = app.get(RagService);
     const configurationService = app.get(RagConfigurationService);
@@ -247,13 +276,14 @@ describe('RAG integration (SQLite, lexical-only)', () => {
     await ragService.ingest({ externalId: 'doc-rb', content: 'Rollback subject content about telescopes.' });
     const initial = await configurationService.getActiveRevision('default');
 
-    // Query-only change: the new revision serves the same physical rows via
-    // its dataRevisionId — nothing is moved.
+    // Query-only changes copy the physical snapshot without calling the
+    // chunker or embedding provider again.
     const updated = await configurationService.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' });
-    expect(updated.revision.dataRevisionId).toBe(initial.dataRevisionId);
+    expect(updated.revision.dataRevisionId).toBe(updated.revision.id);
+    expect(updated.revision.dataRevisionId).not.toBe(initial.dataRevisionId);
     expect((await ragService.search('telescopes')).length).toBeGreaterThan(0);
 
-    // Rolling back is a pure pointer flip — never a silent empty index.
+    // Rolling back switches to the retained immutable snapshot.
     await configurationService.rollback('default', initial.id);
     const results = await ragService.search('telescopes');
     expect(results.length).toBeGreaterThan(0);
@@ -261,32 +291,31 @@ describe('RAG integration (SQLite, lexical-only)', () => {
     await app.close();
   });
 
-  it('serves current content after rolling back to an intermediate query-only revision, including documents ingested after it was archived', async () => {
+  it('restores exact query-only corpus snapshots instead of later writes', async () => {
     const app = await buildApp();
     const ragService = app.get(RagService);
     const configurationService = app.get(RagConfigurationService);
 
-    // A (indexed) -> B (query-only) -> C (query-only): one shared live corpus.
+    // A (indexed) -> B (query-only snapshot) -> C (query-only snapshot).
     await ragService.ingest({ externalId: 'doc-a', content: 'Original article about volcanoes.' });
     const revisionA = await configurationService.getActiveRevision('default');
     const revisionB = (await configurationService.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' })).revision;
+    await ragService.ingest({ externalId: 'doc-b', content: 'Revision B notes about mountains.' });
     await configurationService.updateProfile('default', { searchDefaults: { topK: 6 } }, { applyStrategy: 'apply-immediately' });
 
-    // Mutate the shared corpus while C is active.
+    // This document belongs only to C's snapshot.
     await ragService.ingest({ externalId: 'doc-late', content: 'Late-breaking notes about glaciers.' });
 
-    // Roll back past B to A, then forward to B — the scenario that used to
-    // activate an empty index because the old lineage resolver only walked
-    // backward from the active revision.
     await configurationService.rollback('default', revisionA.id);
     expect((await ragService.search('volcanoes')).length).toBeGreaterThan(0);
+    expect(await ragService.search('mountains')).toHaveLength(0);
+    expect(await ragService.search('glaciers')).toHaveLength(0);
 
     const restoredB = await configurationService.rollback('default', revisionB.id);
-    expect(restoredB.dataRevisionId).toBe(revisionA.dataRevisionId);
-    // The query-only lineage shares one live corpus: B serves both the
-    // original document and the one ingested while C was active.
+    expect(restoredB.dataRevisionId).toBe(revisionB.id);
     expect((await ragService.search('volcanoes')).length).toBeGreaterThan(0);
-    expect((await ragService.search('glaciers')).length).toBeGreaterThan(0);
+    expect((await ragService.search('mountains')).length).toBeGreaterThan(0);
+    expect(await ragService.search('glaciers')).toHaveLength(0);
     await app.close();
   });
 

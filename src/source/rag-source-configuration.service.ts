@@ -60,14 +60,23 @@ export class RagSourceConfigurationService {
     for (const wiring of this.registry.list()) {
       const existing = await this.bindingRepo.findOne({ where: { sourceName: wiring.name } });
       if (existing) continue;
+      const sourceConfiguration = {
+        chunkingOverrides: wiring.defaultChunkingOverrides,
+        retrievalOverrides: wiring.defaultRetrievalOverrides,
+      } satisfies StoredSourceConfiguration;
+      assertAllowedSourceRetrievalOverrides(sourceConfiguration.retrievalOverrides, wiring.name);
+      if (sourceConfiguration.chunkingOverrides || sourceConfiguration.retrievalOverrides) {
+        await this.assertValidEffectiveConfiguration(
+          wiring.name,
+          wiring.defaultProfileName,
+          sourceConfiguration,
+        );
+      }
       await this.bindingRepo.save({
         id: newId(),
         sourceName: wiring.name,
         profileName: wiring.defaultProfileName,
-        sourceConfiguration: {
-          chunkingOverrides: wiring.defaultChunkingOverrides,
-          retrievalOverrides: wiring.defaultRetrievalOverrides,
-        } satisfies StoredSourceConfiguration,
+        sourceConfiguration,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -165,11 +174,22 @@ export class RagSourceConfigurationService {
         this.emitProfileChanged(sourceName, previousProfileName, profileName);
         return { sourceName, previousProfileName, newProfileName: profileName, preview };
       case 'reindex-and-activate': {
-        // Index under the new profile first; the binding and the old
-        // profile's documents are only touched once the new copy actually
-        // exists, so a failed sync leaves the old profile serving intact.
-        const reindexResult = await this.syncSourceAsReindexResult(sourceName, profileName);
+        // The target profile is a preparation area until a complete sync
+        // succeeds. Any stale/partial target copy is removed before and after
+        // a failed attempt, while the old binding and serving copy stay intact.
+        await this.discardPreparedSource(profileName, sourceName);
+        let reindexResult: RagProfileReindexResult;
+        try {
+          reindexResult = await this.syncSourceAsReindexResult(sourceName, profileName);
+        } catch (error) {
+          await this.discardPreparedSource(profileName, sourceName);
+          throw new RagSourceConfigurationError(
+            `Reassigning source "${sourceName}" to profile "${profileName}" failed during re-indexing; ` +
+              `the source remains bound to "${previousProfileName}". Underlying error: ${(error as Error).message}`,
+          );
+        }
         if (!reindexResult.readyForActivation) {
+          await this.discardPreparedSource(profileName, sourceName);
           throw new RagSourceConfigurationError(
             `Reassigning source "${sourceName}" to profile "${profileName}" failed during re-indexing ` +
               `(${reindexResult.failures} failure(s)); the source remains bound to "${previousProfileName}".`,
@@ -342,8 +362,19 @@ export class RagSourceConfigurationService {
       chunksCreated: syncResult.chunksCreated,
       embeddingsCreated: syncResult.embeddingsCreated,
       failures: syncResult.failures,
-      readyForActivation: syncResult.status !== RagOperationStatus.FAILED,
+      readyForActivation: syncResult.status === RagOperationStatus.COMPLETED,
     };
+  }
+
+  private async discardPreparedSource(profileName: string, sourceName: string): Promise<void> {
+    try {
+      await this.indexingService.removeSourceDocuments(profileName, sourceName);
+    } catch (error) {
+      throw new RagSourceConfigurationError(
+        `Could not discard the prepared copy of source "${sourceName}" from profile "${profileName}": ` +
+          `${(error as Error).message}`,
+      );
+    }
   }
 
   private async getBindingOrThrow(sourceName: string): Promise<RagSourceBindingRow> {

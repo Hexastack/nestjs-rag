@@ -164,7 +164,7 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       expect((await service.getActiveRevision('default')).id).toBe(result.revision.id);
     });
 
-    it('shares the existing index rows via dataRevisionId instead of moving or re-indexing them', async () => {
+    it('clones the existing index snapshot without re-chunking or re-embedding', async () => {
       const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
       const originalRevisionId = profile.activeRevisionId!;
       await ctx.repos.document.save({
@@ -190,20 +190,18 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
         { applyStrategy: 'apply-immediately' },
       );
 
-      // Rows stay with the revision that built them; the new revision serves
-      // them by reference.
-      expect(result.revision.dataRevisionId).toBe(originalRevisionId);
+      expect(result.revision.dataRevisionId).toBe(result.revision.id);
       expect(await ctx.repos.document.count({ where: { profileRevisionId: originalRevisionId } })).toBe(1);
-      expect(await ctx.repos.document.count({ where: { profileRevisionId: result.revision.id } })).toBe(0);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: result.revision.id } })).toBe(1);
     });
 
-    it('chained query-only revisions all reference the original indexing revision', async () => {
-      const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
-      const originalRevisionId = profile.activeRevisionId!;
+    it('gives every chained query-only revision its own physical snapshot', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
       const first = await service.updateProfile('default', { searchDefaults: { topK: 10 } }, { applyStrategy: 'apply-immediately' });
       const second = await service.updateProfile('default', { searchDefaults: { topK: 20 } }, { applyStrategy: 'apply-immediately' });
-      expect(first.revision.dataRevisionId).toBe(originalRevisionId);
-      expect(second.revision.dataRevisionId).toBe(originalRevisionId);
+      expect(first.revision.dataRevisionId).toBe(first.revision.id);
+      expect(second.revision.dataRevisionId).toBe(second.revision.id);
+      expect(second.revision.dataRevisionId).not.toBe(first.revision.dataRevisionId);
     });
 
     it('rejects a change that requires re-indexing', async () => {
@@ -376,7 +374,29 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
         async (_profileName: string, revisionId: string) => readyResult(revisionId),
       );
       await service.reindexStagedRevision('default', staged.revision.id);
-      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
+      const retried = await service.getRevision('default', staged.revision.id);
+      expect(retried.status).toBe(RagRevisionStatus.READY);
+      expect(retried.error).toBeUndefined();
+      expect(retried.failedAt).toBeUndefined();
+    });
+
+    it('marks a candidate stale when the active corpus changes during re-indexing', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      indexingService.reindexRevision.mockImplementation(async (_profileName: string, revisionId: string) => {
+        const profile = await ctx.repos.profile.findOneByOrFail({ name: 'default' });
+        await ctx.repos.profile.update(
+          { id: profile.id },
+          { indexGeneration: profile.indexGeneration + 1 },
+        );
+        return readyResult(revisionId);
+      });
+
+      const result = await service.reindexStagedRevision('default', staged.revision.id);
+
+      expect(result.readyForActivation).toBe(false);
+      expect(result.status).toBe(RagOperationStatus.FAILED);
+      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.FAILED);
     });
 
     it('re-indexes the active revision in place without corrupting its status', async () => {
@@ -459,11 +479,7 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       await expect(service.rollback('default', staged.revision.id)).rejects.toThrow(RagProfileRevisionError);
     });
 
-    it('serves the shared row set when rolling back to an intermediate query-only revision after an earlier rollback', async () => {
-      // Regression: A (indexed) -> B (query-only) -> C (query-only), rollback
-      // to A, then rollback to B. Under the old row re-pointing scheme the
-      // lineage resolver only walked backward from the active revision, so B
-      // activated with an empty index. Now B references A's rows directly.
+    it('restores the exact corpus snapshot of each query-only revision', async () => {
       const profile = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
       const revisionA = profile.activeRevisionId!;
       await ctx.repos.document.save({
@@ -483,13 +499,51 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
         updatedAt: new Date(),
       });
       const revisionB = (await service.updateProfile('default', { searchDefaults: { topK: 4 } }, { applyStrategy: 'apply-immediately' })).revision;
-      await service.updateProfile('default', { searchDefaults: { topK: 6 } }, { applyStrategy: 'apply-immediately' });
+      await ctx.repos.document.save({
+        id: 'doc-2',
+        profileName: 'default',
+        profileRevisionId: revisionB.id,
+        sourceName: 'direct',
+        sourceId: 'y',
+        externalId: 'y',
+        namespace: null,
+        content: 'revision B only',
+        contentHash: 'h2',
+        indexingHash: 'h2',
+        sourceUpdatedAt: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      const revisionC = (await service.updateProfile(
+        'default',
+        { searchDefaults: { topK: 6 } },
+        { applyStrategy: 'apply-immediately' },
+      )).revision;
+      await ctx.repos.document.save({
+        id: 'doc-3',
+        profileName: 'default',
+        profileRevisionId: revisionC.id,
+        sourceName: 'direct',
+        sourceId: 'z',
+        externalId: 'z',
+        namespace: null,
+        content: 'revision C only',
+        contentHash: 'h3',
+        indexingHash: 'h3',
+        sourceUpdatedAt: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
 
       await service.rollback('default', revisionA);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: revisionA } })).toBe(1);
       const restored = await service.rollback('default', revisionB.id);
 
-      expect(restored.dataRevisionId).toBe(revisionA);
-      expect(await ctx.repos.document.count({ where: { profileRevisionId: revisionA } })).toBe(1);
+      expect(restored.dataRevisionId).toBe(revisionB.id);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: revisionB.id } })).toBe(2);
+      expect(await ctx.repos.document.count({ where: { profileRevisionId: revisionC.id } })).toBe(3);
     });
   });
 
@@ -518,16 +572,40 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       ).resolves.toBeDefined();
     });
 
+    it('does not persist a staged revision prepared against an active revision that changed concurrently', async () => {
+      const initial = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      jest.spyOn(service as any, 'assertEmbeddingProviderValid').mockImplementationOnce(async () => {
+        await service.updateProfile('default', { searchDefaults: { topK: 7 } }, { applyStrategy: 'apply-immediately' });
+      });
+
+      await expect(
+        service.updateProfile(
+          'default',
+          { chunking: { chunkSize: 400 } },
+          { applyStrategy: 'stage', expectedRevisionId: initial.activeRevisionId! },
+        ),
+      ).rejects.toThrow(RagConcurrencyError);
+
+      expect(await service.listRevisions('default')).toHaveLength(2);
+      expect((await service.getActiveRevision('default')).configuration.searchDefaults?.topK).toBe(7);
+    });
+
+    it('refuses to re-index a staged revision after its base revision changed', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      await service.updateProfile('default', { searchDefaults: { topK: 7 } }, { applyStrategy: 'apply-immediately' });
+
+      await expect(service.reindexStagedRevision('default', staged.revision.id)).rejects.toThrow(RagConcurrencyError);
+      expect(indexingService.reindexRevision).not.toHaveBeenCalled();
+    });
+
     it('rolls back a writer whose check passed but that lost the race before its write transaction (CAS)', async () => {
       const initial = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
 
-      // Interleave a concurrent commit inside the window between the
-      // expectedRevisionId check and the write transaction (the same window
-      // that provider validation occupies in production).
-      const nextRevisionNumber = (service as any).nextRevisionNumber.bind(service) as (id: string) => Promise<number>;
-      jest.spyOn(service as any, 'nextRevisionNumber').mockImplementationOnce(async (...args: unknown[]) => {
+      // Interleave a concurrent commit after the early expectedRevisionId
+      // check but before the outer writer starts its transaction.
+      jest.spyOn(service as any, 'assertEmbeddingProviderValid').mockImplementationOnce(async () => {
         await service.updateProfile('default', { searchDefaults: { topK: 7 } }, { applyStrategy: 'apply-immediately' });
-        return nextRevisionNumber(args[0] as string);
       });
 
       await expect(
@@ -571,9 +649,10 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
 
       const active = await service.getActiveRevision('default');
       expect(active.configuration.searchDefaults?.topK).toBe(7);
-      // The staged revision is untouched and can be activated cleanly later.
+      // The staged revision is now stale and must be re-indexed against the
+      // new active revision before it can activate.
       expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
-      await expect(service.activateRevision('default', staged.revision.id)).resolves.toBeDefined();
+      await expect(service.activateRevision('default', staged.revision.id)).rejects.toThrow(RagProfileActivationError);
       const activeRows = await ctx.repos.profileRevision.count({ where: { status: RagRevisionStatus.ACTIVE } });
       expect(activeRows).toBe(1);
     });
@@ -593,6 +672,7 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
           changeImpact: RagChangeImpact.NONE,
           previousRevisionId: null,
           dataRevisionId: 'rogue-revision',
+          sourceIndexGeneration: null,
           error: null,
           createdAt: new Date(),
           activatedAt: new Date(),
@@ -672,23 +752,16 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
       await expect(service.rollback('default', initial.activeRevisionId!)).rejects.toThrow(RagRevisionNotFoundError);
     });
 
-    it('never purges a revision whose row set another retained revision still references', async () => {
+    it('can purge query-only revisions independently because each owns its snapshot', async () => {
       const initial = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
       const originalRevisionId = initial.activeRevisionId!;
-      // Query-only updates: the active revision serves the original
-      // revision's rows via dataRevisionId, so the original must survive
-      // cleanup even with keep: 0. The intermediate query-only revision owns
-      // nothing and is purged.
       const intermediate = await service.updateProfile('default', { searchDefaults: { topK: 1 } }, { applyStrategy: 'apply-immediately' });
       await service.updateProfile('default', { searchDefaults: { topK: 2 } }, { applyStrategy: 'apply-immediately' });
 
       const { deleted } = await service.cleanupArchivedRevisions('default', { keep: 0 });
       expect(deleted).toContain(intermediate.revision.id);
-      expect(deleted).not.toContain(originalRevisionId);
-
-      // The original revision's rows are intact, so rolling back to it works.
-      const rolledBack = await service.rollback('default', originalRevisionId);
-      expect(rolledBack.status).toBe(RagRevisionStatus.ACTIVE);
+      expect(deleted).toContain(originalRevisionId);
+      await expect(service.rollback('default', originalRevisionId)).rejects.toThrow(RagRevisionNotFoundError);
     });
   });
 

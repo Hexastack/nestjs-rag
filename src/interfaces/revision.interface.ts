@@ -32,11 +32,9 @@ export interface RagProfileRevision {
   failedAt?: Date;
   previousRevisionId?: string;
   /**
-   * Id of the revision whose physical index rows (documents, chunks,
-   * embeddings) this revision serves. Equal to `id` for revisions that were
-   * indexed themselves; for query-only (apply-immediately) revisions it
-   * points to the ancestor that last re-indexed, since query-only changes
-   * share that ancestor's row set instead of copying or moving it.
+   * Id of the revision whose immutable physical index snapshot (documents,
+   * chunks, embeddings) this revision serves. New revisions own their
+   * snapshot, so rolling back restores both configuration and corpus.
    */
   dataRevisionId: string;
   error?: RagSerializedError;
