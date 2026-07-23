@@ -326,5 +326,70 @@ describe('RagIndexingService', () => {
       expect(result.readyForActivation).toBe(true);
       expect(result.sources).toHaveLength(2);
     });
+
+    it('carries forward bound sources excluded by options.sources into the new revision', async () => {
+      await ctx.repos.sourceBinding.save([
+        { id: 'b1', sourceName: 'kb1', profileName: 'default', sourceConfiguration: {}, createdAt: new Date(), updatedAt: new Date() },
+        { id: 'b2', sourceName: 'kb2', profileName: 'default', sourceConfiguration: {}, createdAt: new Date(), updatedAt: new Date() },
+      ] as any);
+      sourceRegistry.register({
+        name: 'kb1',
+        kind: 'provider',
+        provider: new InMemorySourceProvider('kb1', [{ externalId: '1', content: 'kb1 content about routers' }]),
+        defaultProfileName: 'default',
+      } as any);
+      sourceRegistry.register({
+        name: 'kb2',
+        kind: 'provider',
+        provider: new InMemorySourceProvider('kb2', [{ externalId: '1', content: 'kb2 content about billing' }]),
+        defaultProfileName: 'default',
+      } as any);
+
+      // Populate the active revision (rev-1) with both sources plus a direct document.
+      await service.reindexRevision('default', 'rev-1');
+      await service.ingest({ externalId: 'manual-1', content: 'directly ingested content' });
+
+      // Partial re-index of a staged revision (fresh row set): only kb1 is re-fetched.
+      const result = await service.reindexRevision('default', 'rev-2', { sources: ['kb1'] });
+
+      expect(result.readyForActivation).toBe(true);
+      const sourceNames = result.sources.map((s) => s.sourceName).sort();
+      expect(sourceNames).toEqual(['direct', 'kb1', 'kb2']);
+
+      // kb2 and the direct document were carried forward, not dropped.
+      const rev2Docs = await ctx.repos.document.find({ where: { profileRevisionId: 'rev-2' } });
+      const bySource = new Map(rev2Docs.map((d) => [`${d.sourceName}:${d.externalId}`, d]));
+      expect(bySource.has('kb1:1')).toBe(true);
+      expect(bySource.has('kb2:1')).toBe(true);
+      expect(bySource.has('direct:manual-1')).toBe(true);
+      expect(bySource.get('kb2:1')!.content).toBe('kb2 content about billing');
+
+      // Carried-forward documents were re-chunked into the new revision's row set.
+      const kb2Chunks = await ctx.repos.chunk.count({
+        where: { profileRevisionId: 'rev-2', documentId: bySource.get('kb2:1')!.id },
+      });
+      expect(kb2Chunks).toBeGreaterThan(0);
+    });
+
+    it('does not report an empty sources filter as ready with nothing indexed', async () => {
+      await ctx.repos.sourceBinding.save([
+        { id: 'b1', sourceName: 'kb1', profileName: 'default', sourceConfiguration: {}, createdAt: new Date(), updatedAt: new Date() },
+      ] as any);
+      sourceRegistry.register({
+        name: 'kb1',
+        kind: 'provider',
+        provider: new InMemorySourceProvider('kb1', [{ externalId: '1', content: 'kb1 content about routers' }]),
+        defaultProfileName: 'default',
+      } as any);
+      await service.reindexRevision('default', 'rev-1');
+
+      const result = await service.reindexRevision('default', 'rev-2', { sources: [] });
+
+      // Everything is carried forward from the active revision, so the new
+      // revision is complete rather than empty.
+      expect(result.documentsIndexed).toBe(1);
+      const rev2Docs = await ctx.repos.document.count({ where: { profileRevisionId: 'rev-2' } });
+      expect(rev2Docs).toBe(1);
+    });
   });
 });

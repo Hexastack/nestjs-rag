@@ -248,15 +248,18 @@ export class RagIndexingService {
       }
     }
 
-    // Documents that don't come from a registered source (direct ingestion
-    // via `ragService.ingest`, source name "direct" or any ad-hoc name) have
-    // no provider to re-fetch them from — but their full content is stored in
-    // rag_documents, so they are re-chunked/re-embedded from the currently
-    // active revision's stored copy. Without this, activating the new
-    // revision would silently drop everything that was directly ingested.
+    // Documents that were not freshly synced above still have to make it
+    // into the new revision's row set: documents from unregistered sources
+    // (direct ingestion via `ragService.ingest`, source name "direct" or any
+    // ad-hoc name) have no provider to re-fetch them from, and bound sources
+    // excluded by `options.sources` were deliberately not re-fetched. Both
+    // have their full content stored in rag_documents, so they are
+    // re-chunked/re-embedded from the currently active revision's stored
+    // copy. Without this, activating the new revision would silently drop
+    // everything that was not part of this (possibly partial) re-index.
     if (!aborted) {
-      const boundNames = new Set(allBindings.map((b) => b.sourceName));
-      sourceResults.push(...(await this.reindexUnboundDocuments(context, boundNames, options)));
+      const syncedNames = new Set(targetBindings.map((b) => b.sourceName));
+      sourceResults.push(...(await this.reindexCarriedForwardDocuments(context, syncedNames, options)));
     }
 
     const documentsIndexed = sourceResults.reduce((sum, r) => sum + r.documentsIndexed, 0);
@@ -351,15 +354,22 @@ export class RagIndexingService {
 
   /**
    * Re-indexes, into `revision`, every document of the profile's currently
-   * active revision whose source has no binding (direct ingestion and ad-hoc
-   * source names). Content comes from the stored `rag_documents.content`,
-   * re-chunked/re-embedded under the new revision's configuration. Results
-   * are grouped per source name so they surface in the reindex report like
-   * any other source.
+   * active revision whose source was not freshly synced by this re-index:
+   * sources with no binding (direct ingestion and ad-hoc source names) and
+   * bound sources excluded by a partial re-index's `options.sources` filter.
+   * Content comes from the stored `rag_documents.content`, re-chunked/
+   * re-embedded under the new revision's configuration — for bound sources
+   * with the source's current chunking/retrieval overrides, exactly as a
+   * real sync would apply them. Results are grouped per source name so they
+   * surface in the reindex report like any other source.
+   *
+   * Carried-forward content is the active revision's snapshot: records
+   * deleted at the provider since that source's last sync persist until the
+   * source is next synced for real.
    */
-  private async reindexUnboundDocuments(
+  private async reindexCarriedForwardDocuments(
     revision: RevisionContext,
-    boundSourceNames: Set<string>,
+    syncedSourceNames: Set<string>,
     options: RagProfileReindexOptions,
   ): Promise<RagSourceSyncResult[]> {
     let activeDataRevisionId: string;
@@ -372,11 +382,38 @@ export class RagIndexingService {
     if (activeDataRevisionId === revision.dataRevisionId) return [];
 
     const documents = await this.documentRepo.find({ where: { profileRevisionId: activeDataRevisionId } });
-    const unbound = documents.filter((d) => !boundSourceNames.has(d.sourceName));
-    if (unbound.length === 0) return [];
+    const carried = documents.filter((d) => !syncedSourceNames.has(d.sourceName));
+    if (carried.length === 0) return [];
+
+    const indexOptionsCache = new Map<
+      string,
+      {
+        chunkingOverrides?: Partial<RagProfileConfiguration['chunking']>;
+        retrievalOverrides?: Partial<RagProfileConfiguration['retrieval']>;
+        mappingVersion?: string;
+      }
+    >();
+    const indexOptionsFor = async (sourceName: string) => {
+      let cached = indexOptionsCache.get(sourceName);
+      if (!cached) {
+        if (this.sourceRegistry.has(sourceName)) {
+          const wiring = this.sourceRegistry.get(sourceName);
+          const overrides = await this.getEffectiveSourceOverrides(sourceName, wiring);
+          cached = {
+            chunkingOverrides: overrides.chunking,
+            retrievalOverrides: overrides.retrieval,
+            mappingVersion: wiring.mappingVersion,
+          };
+        } else {
+          cached = {};
+        }
+        indexOptionsCache.set(sourceName, cached);
+      }
+      return cached;
+    };
 
     const bySource = new Map<string, { results: RagIngestResult[]; errors: Array<{ externalId: string; message: string }> }>();
-    for (const document of unbound) {
+    for (const document of carried) {
       const bucket = bySource.get(document.sourceName) ?? { results: [], errors: [] };
       bySource.set(document.sourceName, bucket);
       try {
@@ -389,7 +426,10 @@ export class RagIndexingService {
           deletedAt: null,
         };
         bucket.results.push(
-          await this.indexRecord(revision, document.sourceName, document.sourceId, record, { replaceExisting: true }),
+          await this.indexRecord(revision, document.sourceName, document.sourceId, record, {
+            ...(await indexOptionsFor(document.sourceName)),
+            replaceExisting: true,
+          }),
         );
       } catch (error) {
         bucket.errors.push({ externalId: document.externalId, message: (error as Error).message });

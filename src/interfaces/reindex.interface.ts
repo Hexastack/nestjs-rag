@@ -25,7 +25,14 @@ export interface RagSourceSyncResult {
 }
 
 export interface RagProfileReindexOptions {
-  /** Restrict the re-index to these source names (defaults to every source bound to the profile). */
+  /**
+   * Restrict the re-index to these source names (defaults to every source
+   * bound to the profile). Sources left out are not dropped: their documents
+   * are carried forward into the new revision from the active revision's
+   * stored content, re-chunked/re-embedded under the new configuration. That
+   * carried-forward content is a snapshot — records deleted at the provider
+   * since an omitted source's last sync persist until it is next synced.
+   */
   sources?: string[];
   batchSize?: number;
   continueOnError?: boolean;
