@@ -496,6 +496,89 @@ describe('RagConfigurationService (SQLite-backed, real persistence)', () => {
         ),
       ).resolves.toBeDefined();
     });
+
+    it('rolls back a writer whose check passed but that lost the race before its write transaction (CAS)', async () => {
+      const initial = await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+
+      // Interleave a concurrent commit inside the window between the
+      // expectedRevisionId check and the write transaction (the same window
+      // that provider validation occupies in production).
+      const nextRevisionNumber = (service as any).nextRevisionNumber.bind(service) as (id: string) => Promise<number>;
+      jest.spyOn(service as any, 'nextRevisionNumber').mockImplementationOnce(async (...args: unknown[]) => {
+        await service.updateProfile('default', { searchDefaults: { topK: 7 } }, { applyStrategy: 'apply-immediately' });
+        return nextRevisionNumber(args[0] as string);
+      });
+
+      await expect(
+        service.updateProfile(
+          'default',
+          { searchDefaults: { topK: 99 } },
+          { applyStrategy: 'apply-immediately', expectedRevisionId: initial.activeRevisionId! },
+        ),
+      ).rejects.toThrow(RagConcurrencyError);
+
+      // The concurrent writer's change survives; the loser left no trace.
+      const active = await service.getActiveRevision('default');
+      expect(active.configuration.searchDefaults?.topK).toBe(7);
+      const activeRows = await ctx.repos.profileRevision.count({ where: { status: RagRevisionStatus.ACTIVE } });
+      expect(activeRows).toBe(1);
+    });
+
+    it('activateRevision detects a pointer flipped after its pre-transaction checks (CAS)', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const staged = await service.updateProfile('default', { chunking: { chunkSize: 400 } }, { applyStrategy: 'stage' });
+      indexingService.reindexRevision.mockResolvedValue({
+        profileName: 'default',
+        revisionId: staged.revision.id,
+        status: RagOperationStatus.COMPLETED,
+        sources: [],
+        documentsIndexed: 1,
+        chunksCreated: 2,
+        embeddingsCreated: 0,
+        failures: 0,
+        readyForActivation: true,
+      } satisfies RagProfileReindexResult);
+      await service.reindexStagedRevision('default', staged.revision.id);
+
+      // A concurrent writer activates a different revision while this
+      // activation is between its snapshot checks and its transaction.
+      jest.spyOn(service as any, 'validateIndexConsistency').mockImplementationOnce(async () => {
+        await service.updateProfile('default', { searchDefaults: { topK: 7 } }, { applyStrategy: 'apply-immediately' });
+      });
+
+      await expect(service.activateRevision('default', staged.revision.id)).rejects.toThrow(RagConcurrencyError);
+
+      const active = await service.getActiveRevision('default');
+      expect(active.configuration.searchDefaults?.topK).toBe(7);
+      // The staged revision is untouched and can be activated cleanly later.
+      expect((await service.getRevision('default', staged.revision.id)).status).toBe(RagRevisionStatus.READY);
+      await expect(service.activateRevision('default', staged.revision.id)).resolves.toBeDefined();
+      const activeRows = await ctx.repos.profileRevision.count({ where: { status: RagRevisionStatus.ACTIVE } });
+      expect(activeRows).toBe(1);
+    });
+
+    it('the database itself refuses a second active revision per profile (partial unique index)', async () => {
+      await service.createProfile({ name: 'default', configuration: lexicalConfig() });
+      const profileRow = await ctx.repos.profile.findOne({ where: { name: 'default' } });
+      await expect(
+        ctx.repos.profileRevision.insert({
+          id: 'rogue-revision',
+          profileId: profileRow!.id,
+          profileName: 'default',
+          revisionNumber: 999,
+          status: RagRevisionStatus.ACTIVE,
+          configuration: lexicalConfig(),
+          configurationHash: 'rogue',
+          changeImpact: RagChangeImpact.NONE,
+          previousRevisionId: null,
+          dataRevisionId: 'rogue-revision',
+          error: null,
+          createdAt: new Date(),
+          activatedAt: new Date(),
+          failedAt: null,
+        }),
+      ).rejects.toThrow(/unique/i);
+    });
   });
 
   describe('revision immutability', () => {

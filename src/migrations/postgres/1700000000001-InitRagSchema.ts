@@ -50,6 +50,11 @@ export class InitRagSchema1700000000001 implements MigrationInterface {
     await queryRunner.query(
       `CREATE UNIQUE INDEX IF NOT EXISTS "rag_idx_revisions_profile_number" ON "rag_profile_revisions" ("profile_id", "revision_number")`,
     );
+    // At most one active revision per profile — DB-level backstop for the
+    // compare-and-swap pointer flips in RagConfigurationService.
+    await queryRunner.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS "rag_idx_revisions_one_active" ON "rag_profile_revisions" ("profile_id") WHERE "status" = 'active'`,
+    );
 
     await queryRunner.query(`
       CREATE TABLE IF NOT EXISTS "rag_source_bindings" (

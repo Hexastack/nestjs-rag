@@ -417,6 +417,8 @@ import { InitRagPostgresSchema1700000000001, AddPgvectorSupport1700000000002 } f
 
 `updateProfile(name, patch, { expectedRevisionId })` implements compare-and-swap: if `expectedRevisionId` doesn't match the profile's current active revision, the call throws `RagConcurrencyError` instead of applying a stale change.
 
+The guarantee is enforced at write time, not just checked up front: every active-pointer flip (`applyImmediateRevision`, `activateRevision`) is a conditional `UPDATE ... WHERE active_revision_id = <the revision the change was prepared against>` inside the write transaction. A concurrent writer that activates another revision between validation and commit makes the conditional update match zero rows, and the losing transaction rolls back with `RagConcurrencyError` — it can never archive the wrong revision, resurrect a stale configuration, or leave a second row marked `active`. A partial unique index (`one active revision per profile`) backs this up at the database level.
+
 ## Failure recovery
 
 - A revision that fails re-indexing is marked `failed` and **never** becomes active; the previously active revision keeps serving searches untouched.

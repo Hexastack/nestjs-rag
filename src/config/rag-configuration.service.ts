@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger, forwardRef } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import { DataSource, EntityManager, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, IsNull, Repository } from 'typeorm';
 import {
   RAG_CHUNK_EMBEDDING_REPOSITORY,
   RAG_CHUNK_REPOSITORY,
@@ -254,7 +254,11 @@ export class RagConfigurationService {
    *
    * Pass `options.expectedRevisionId` for optimistic concurrency control:
    * the update fails with `RagConcurrencyError` if another writer activated
-   * a different revision in the meantime.
+   * a different revision in the meantime. The early check below fails fast,
+   * but the guarantee comes from the write transactions themselves: every
+   * pointer flip is a conditional update (compare-and-swap) on the revision
+   * the change was prepared against, so a writer racing past the check
+   * still cannot apply against a stale revision.
    */
   async updateProfile(
     profileName: string,
@@ -336,20 +340,44 @@ export class RagConfigurationService {
     await this.validateIndexConsistency(revisionRow);
 
     const now = new Date();
+    const expectedActiveId = profileRow.activeRevisionId;
     await this.dataSource.transaction(async (manager) => {
-      if (profileRow.activeRevisionId && profileRow.activeRevisionId !== revisionId) {
+      // Compare-and-swap: only flip the pointer if it still is what we
+      // loaded above — the status/consistency checks ran against that
+      // snapshot, and a concurrent writer may have activated another
+      // revision since. `affected` 0 rolls the whole activation back.
+      const flip = await manager.update(
+        this.profileRepo.target,
+        { id: profileRow.id, activeRevisionId: expectedActiveId ?? IsNull() },
+        { activeRevisionId: revisionId, updatedAt: now },
+      );
+      if (!flip.affected) {
+        const fresh = await manager.findOne(this.profileRepo.target, { where: { id: profileRow.id } });
+        throw new RagConcurrencyError(profileName, expectedActiveId ?? 'none', fresh?.activeRevisionId ?? 'none');
+      }
+      // Archive before activating so the one-active-per-profile partial
+      // unique index is never transiently violated; the ACTIVE predicate
+      // makes the archive a no-op if the row already left that status.
+      if (expectedActiveId && expectedActiveId !== revisionId) {
         await manager.update(
           this.revisionRepo.target,
-          { id: profileRow.activeRevisionId },
+          { id: expectedActiveId, status: RagRevisionStatus.ACTIVE },
           { status: RagRevisionStatus.ARCHIVED },
         );
       }
-      await manager.update(
+      // Re-assert eligibility at write time: the pre-transaction status
+      // check ran on a snapshot, and e.g. a concurrent re-index may have
+      // moved the revision back out of `ready` since.
+      const activated = await manager.update(
         this.revisionRepo.target,
-        { id: revisionId },
+        { id: revisionId, status: In([RagRevisionStatus.READY, RagRevisionStatus.ARCHIVED]) },
         { status: RagRevisionStatus.ACTIVE, activatedAt: now },
       );
-      await manager.update(this.profileRepo.target, { id: profileRow.id }, { activeRevisionId: revisionId, updatedAt: now });
+      if (!activated.affected) {
+        throw new RagProfileActivationError(
+          `Revision "${revisionId}" changed status concurrently and is no longer eligible for activation.`,
+        );
+      }
     });
 
     const updated = await this.getRevision(profileName, revisionId);
@@ -545,6 +573,30 @@ export class RagConfigurationService {
     const nextNumber = await this.nextRevisionNumber(profileRow.id);
 
     await this.dataSource.transaction(async (manager) => {
+      // Compare-and-swap: the pointer flip only succeeds if the active
+      // revision is still the one this change was prepared (and, when
+      // provided, `expectedRevisionId`-checked) against. A concurrent writer
+      // that activated another revision in the meantime makes `affected` 0,
+      // rolling everything back instead of applying a patch computed from a
+      // stale configuration.
+      const flip = await manager.update(
+        this.profileRepo.target,
+        { id: profileRow.id, activeRevisionId: activeRow.id },
+        { activeRevisionId: newRevisionId, updatedAt: now },
+      );
+      if (!flip.affected) {
+        const fresh = await manager.findOne(this.profileRepo.target, { where: { id: profileRow.id } });
+        throw new RagConcurrencyError(profileRow.name, activeRow.id, fresh?.activeRevisionId ?? 'none');
+      }
+      // Archive before inserting the new ACTIVE row so the one-active-per-
+      // profile partial unique index is never transiently violated. The
+      // status predicate keeps this from stomping a row some other state
+      // transition already moved out of ACTIVE.
+      await manager.update(
+        this.revisionRepo.target,
+        { id: activeRow.id, status: RagRevisionStatus.ACTIVE },
+        { status: RagRevisionStatus.ARCHIVED },
+      );
       await manager.save(this.revisionRepo.target, {
         id: newRevisionId,
         profileId: profileRow.id,
@@ -561,8 +613,6 @@ export class RagConfigurationService {
         activatedAt: now,
         failedAt: null,
       });
-      await manager.update(this.revisionRepo.target, { id: activeRow.id }, { status: RagRevisionStatus.ARCHIVED });
-      await manager.update(this.profileRepo.target, { id: profileRow.id }, { activeRevisionId: newRevisionId, updatedAt: now });
     });
 
     const revision = await this.getRevision(profileRow.name, newRevisionId);

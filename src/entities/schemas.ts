@@ -115,6 +115,16 @@ export function createEntitySchemas(
         columns: ['profileId', 'revisionNumber'],
         unique: true,
       },
+      // DB-level backstop for the application-level compare-and-swap in
+      // RagConfigurationService: no interleaving of writers can ever leave
+      // two revisions of one profile marked active. Partial indexes are
+      // supported by both Postgres and SQLite.
+      {
+        name: t('idx_revisions_one_active'),
+        columns: ['profileId'],
+        unique: true,
+        where: `"status" = 'active'`,
+      },
     ],
   });
 
